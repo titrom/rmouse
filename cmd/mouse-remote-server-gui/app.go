@@ -1,0 +1,262 @@
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"github.com/zalando/go-keyring"
+
+	"github.com/titrom/rmouse/internal/app/server"
+	"github.com/titrom/rmouse/internal/proto"
+	"github.com/titrom/rmouse/internal/transport"
+)
+
+const (
+	keyringService = "rmouse-server"
+	keyringUser    = "default"
+)
+
+type App struct {
+	ctx context.Context
+
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func NewApp() *App { return &App{} }
+
+func (a *App) startup(ctx context.Context) { a.ctx = ctx }
+
+func (a *App) shutdown(_ context.Context) { _ = a.Stop() }
+
+// --- DTOs ----------------------------------------------------------------
+
+type ConfigDTO struct {
+	Addr      string `json:"addr"`
+	Token     string `json:"token"`
+	RelayAddr string `json:"relayAddr"`
+	Session   string `json:"session"`
+}
+
+type MonitorDTO struct {
+	ID      uint8  `json:"id"`
+	X       int32  `json:"x"`
+	Y       int32  `json:"y"`
+	W       uint32 `json:"w"`
+	H       uint32 `json:"h"`
+	Primary bool   `json:"primary"`
+	Name    string `json:"name"`
+}
+
+func toMonitorDTOs(mons []proto.Monitor) []MonitorDTO {
+	out := make([]MonitorDTO, len(mons))
+	for i, m := range mons {
+		out[i] = MonitorDTO{ID: m.ID, X: m.X, Y: m.Y, W: m.W, H: m.H, Primary: m.Primary, Name: m.Name}
+	}
+	return out
+}
+
+// --- Config persistence --------------------------------------------------
+
+type persistedConfig struct {
+	Addr      string `json:"addr"`
+	RelayAddr string `json:"relayAddr"`
+	Session   string `json:"session"`
+}
+
+func configPath() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "rmouse", "server-gui.json"), nil
+}
+
+func (a *App) LoadConfig() (ConfigDTO, error) {
+	dto := ConfigDTO{Addr: "0.0.0.0:24242"}
+	path, err := configPath()
+	if err != nil {
+		return dto, nil
+	}
+	if raw, err := os.ReadFile(path); err == nil {
+		var p persistedConfig
+		if err := json.Unmarshal(raw, &p); err == nil {
+			if p.Addr != "" {
+				dto.Addr = p.Addr
+			}
+			dto.RelayAddr = p.RelayAddr
+			dto.Session = p.Session
+		}
+	}
+	if tok, err := keyring.Get(keyringService, keyringUser); err == nil {
+		dto.Token = tok
+	}
+	return dto, nil
+}
+
+func (a *App) SaveConfig(cfg ConfigDTO) error {
+	path, err := configPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	p := persistedConfig{Addr: cfg.Addr, RelayAddr: cfg.RelayAddr, Session: cfg.Session}
+	raw, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return err
+	}
+	if cfg.Token == "" {
+		_ = keyring.Delete(keyringService, keyringUser)
+	} else {
+		if err := keyring.Set(keyringService, keyringUser, cfg.Token); err != nil {
+			return fmt.Errorf("keyring: %w", err)
+		}
+	}
+	return nil
+}
+
+// CertFingerprint returns SHA-256 hex of the DER-encoded self-signed cert.
+// The fingerprint is how a client operator verifies the server's identity
+// out-of-band (paste it into the client, compare face-to-face, etc.).
+func (a *App) CertFingerprint() (string, error) {
+	certPath, keyPath, err := server.CertPaths()
+	if err != nil {
+		return "", err
+	}
+	// Generate the cert on first run so the fingerprint is always available.
+	// server.Run also calls EnsureServerCert; calling it here is idempotent.
+	if err := transport.EnsureServerCert(certPath, keyPath); err != nil {
+		return "", err
+	}
+	raw, err := os.ReadFile(certPath)
+	if err != nil {
+		return "", err
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		return "", errors.New("cert file not PEM-encoded")
+	}
+	sum := sha256.Sum256(block.Bytes)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// --- Session control -----------------------------------------------------
+
+func (a *App) Start(cfg ConfigDTO) error {
+	a.mu.Lock()
+	if a.cancel != nil {
+		a.mu.Unlock()
+		return errors.New("already running")
+	}
+	if cfg.Token == "" {
+		a.mu.Unlock()
+		return errors.New("token is required")
+	}
+	ctx, cancel := context.WithCancel(a.ctx)
+	done := make(chan struct{})
+	a.cancel = cancel
+	a.done = done
+	a.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		sc := server.Config{
+			Addr:      cfg.Addr,
+			Token:     cfg.Token,
+			RelayAddr: cfg.RelayAddr,
+			Session:   cfg.Session,
+		}
+		err := server.Run(ctx, sc, func(ev server.Event) {
+			a.emitEvent(ev)
+		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			runtime.EventsEmit(a.ctx, "rmouse:fatal", err.Error())
+		}
+		a.mu.Lock()
+		a.cancel = nil
+		a.done = nil
+		a.mu.Unlock()
+		runtime.EventsEmit(a.ctx, "rmouse:stopped", nil)
+	}()
+	// Give the listener a moment to bind before returning so the frontend
+	// can distinguish "starting" from "bound".
+	time.Sleep(50 * time.Millisecond)
+	return nil
+}
+
+func (a *App) Stop() error {
+	a.mu.Lock()
+	cancel, done := a.cancel, a.done
+	a.mu.Unlock()
+	if cancel == nil {
+		return nil
+	}
+	cancel()
+	<-done
+	return nil
+}
+
+func (a *App) IsRunning() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cancel != nil
+}
+
+func (a *App) emitEvent(ev server.Event) {
+	switch e := ev.(type) {
+	case server.ListeningEvent:
+		runtime.EventsEmit(a.ctx, "rmouse:listening", map[string]any{
+			"addr": e.Addr, "certPath": e.CertPath,
+		})
+	case server.ServingViaRelayEvent:
+		runtime.EventsEmit(a.ctx, "rmouse:listening", map[string]any{
+			"relay": e.Relay, "session": e.Session, "certPath": e.CertPath,
+		})
+	case server.ClientConnectedEvent:
+		runtime.EventsEmit(a.ctx, "rmouse:client", map[string]any{
+			"state":    "connected",
+			"id":       string(e.ID),
+			"name":     e.Name,
+			"remote":   e.RemoteAddr,
+			"monitors": toMonitorDTOs(e.Monitors),
+		})
+	case server.MonitorsChangedEvent:
+		runtime.EventsEmit(a.ctx, "rmouse:client", map[string]any{
+			"state":    "monitorsChanged",
+			"id":       string(e.ID),
+			"name":     e.Name,
+			"remote":   e.RemoteAddr,
+			"monitors": toMonitorDTOs(e.Monitors),
+		})
+	case server.ByeEvent:
+		runtime.EventsEmit(a.ctx, "rmouse:client", map[string]any{
+			"state": "bye", "id": string(e.ID), "name": e.Name, "remote": e.RemoteAddr, "reason": e.Reason,
+		})
+	case server.ClientDisconnectedEvent:
+		payload := map[string]any{"state": "disconnected", "id": string(e.ID), "name": e.Name, "remote": e.RemoteAddr}
+		if e.Err != nil {
+			payload["err"] = e.Err.Error()
+		}
+		runtime.EventsEmit(a.ctx, "rmouse:client", payload)
+	case server.RecvErrorEvent:
+		runtime.EventsEmit(a.ctx, "rmouse:recvError", map[string]any{
+			"id": string(e.ID), "name": e.Name, "remote": e.RemoteAddr, "err": e.Err.Error(),
+		})
+	}
+}

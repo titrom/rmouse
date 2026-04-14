@@ -1,0 +1,12 @@
+/bin/
+/dist/
+*.exe
+*.test
+*.prof
+*.log
+.idea/
+.vscode/
+# Local secrets / generated certs
+/certs/
+*.pem
+*.key

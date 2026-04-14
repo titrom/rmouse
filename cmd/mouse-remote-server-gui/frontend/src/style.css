@@ -1,0 +1,279 @@
+/* Theme is picked by a class that main.svelte adds to <body> on mount:
+ *   .platform-windows / .platform-darwin → glass (Mica/vibrancy shows through)
+ *   .platform-linux                      → solid libadwaita-style surfaces
+ * Variables in :root are the Windows/Mac glass default; .platform-linux
+ * overrides them. Light mode follows the system preference on each branch. */
+
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  --bg: transparent;
+  --fg: rgba(255, 255, 255, 0.92);
+  --fg-dim: rgba(255, 255, 255, 0.62);
+  --panel: rgba(255, 255, 255, 0.06);
+  --panel-strong: rgba(255, 255, 255, 0.1);
+  --panel-blur: blur(24px) saturate(180%);
+  --border: rgba(255, 255, 255, 0.12);
+  --border-hover: rgba(255, 255, 255, 0.22);
+  --accent: #7aa7ff;
+  --accent-strong: #5c8cff;
+  --accent-fg: #0a0f1d;
+  --ok: #6ee7a8;
+  --err: #ff8a8a;
+  --warn: #ffcc66;
+  --radius: 12px;
+  --radius-sm: 8px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Display",
+    "Segoe UI", Roboto, Inter, "Helvetica Neue", sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", "Consolas", monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --fg: rgba(20, 24, 40, 0.92);
+    --fg-dim: rgba(20, 24, 40, 0.55);
+    --panel: rgba(255, 255, 255, 0.45);
+    --panel-strong: rgba(255, 255, 255, 0.65);
+    --border: rgba(20, 24, 40, 0.1);
+    --border-hover: rgba(20, 24, 40, 0.2);
+  }
+}
+
+/* ---------- Linux: libadwaita-inspired native look ---------- */
+body.platform-linux {
+  --bg: #242424;
+  --fg: #ffffff;
+  --fg-dim: rgba(255, 255, 255, 0.6);
+  --panel: #303030;
+  --panel-strong: #3a3a3a;
+  --panel-blur: none;
+  --border: rgba(255, 255, 255, 0.1);
+  --border-hover: rgba(255, 255, 255, 0.18);
+  --accent: #62a0ea;
+  --accent-strong: #3584e4;
+  --accent-fg: #ffffff;
+  --font: "Inter", "Cantarell", "Ubuntu", system-ui, sans-serif;
+}
+
+@media (prefers-color-scheme: light) {
+  body.platform-linux {
+    --bg: #fafafa;
+    --fg: rgba(0, 0, 0, 0.87);
+    --fg-dim: rgba(0, 0, 0, 0.55);
+    --panel: #ffffff;
+    --panel-strong: #f0f0f0;
+    --border: rgba(0, 0, 0, 0.08);
+    --border-hover: rgba(0, 0, 0, 0.15);
+    --accent: #3584e4;
+    --accent-strong: #1c71d8;
+  }
+}
+
+body.platform-linux .panel {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+body.platform-linux ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+body.platform-linux ::-webkit-scrollbar-track {
+  background: transparent;
+}
+body.platform-linux ::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.4);
+  border-radius: 4px;
+}
+body.platform-linux ::-webkit-scrollbar-thumb:hover {
+  background: rgba(128, 128, 128, 0.6);
+}
+
+/* ---------- Shared ---------- */
+html, body, #app {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+#app {
+  min-height: 100vh;
+  padding: 20px;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.app-title {
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.panel {
+  background: var(--panel);
+  backdrop-filter: var(--panel-blur);
+  -webkit-backdrop-filter: var(--panel-blur);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  margin-bottom: 14px;
+}
+
+.panel-title {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  margin-bottom: 10px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.row label {
+  width: 100px;
+  color: var(--fg-dim);
+  font-size: 13px;
+}
+
+input {
+  flex: 1;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--panel-strong);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+input:focus {
+  border-color: var(--accent);
+}
+
+body.platform-linux input:focus {
+  box-shadow: 0 0 0 2px rgba(53, 132, 228, 0.25);
+}
+
+button {
+  padding: 8px 16px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--panel-strong);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--border-hover);
+}
+
+body.platform-windows button:hover:not(:disabled),
+body.platform-darwin button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+button.primary {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  background: var(--panel-strong);
+}
+
+.badge.ok { color: var(--ok); border-color: rgba(110, 231, 168, 0.4); }
+.badge.err { color: var(--err); border-color: rgba(255, 138, 138, 0.4); }
+.badge.warn { color: var(--warn); border-color: rgba(255, 204, 102, 0.4); }
+.badge .dot {
+  width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 6px 12px;
+  font-size: 13px;
+}
+
+.kv .k { color: var(--fg-dim); }
+.kv .v { font-variant-numeric: tabular-nums; }
+
+.log {
+  max-height: 180px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg-dim);
+  line-height: 1.5;
+}
+
+.log .line { margin: 0; padding: 1px 0; }
+.log .line.err { color: var(--err); }
+.log .line.ok { color: var(--ok); }
+.log .line.warn { color: var(--warn); }
+
+.monitors {
+  width: 100%;
+  min-height: 160px;
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  border: 1px solid var(--border);
+}
+
+body.platform-linux .monitors {
+  background: rgba(0, 0, 0, 0.18);
+}
+
+@media (prefers-color-scheme: light) {
+  body.platform-linux .monitors {
+    background: rgba(0, 0, 0, 0.04);
+  }
+}
+
+.monitor-label {
+  fill: var(--fg-dim);
+  font-size: 10px;
+  font-family: var(--font-mono);
+}
