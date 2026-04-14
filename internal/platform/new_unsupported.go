@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/titrom/rmouse/internal/platform/inputevent"
 	"github.com/titrom/rmouse/internal/proto"
 )
 
@@ -25,3 +26,12 @@ func New() Display { return unsupported{} }
 func NewInjector() (Injector, error) {
 	return nil, errors.New("platform: input injection not implemented on this OS")
 }
+
+type unsupportedCapturer struct{}
+
+func (unsupportedCapturer) Capture(context.Context) (<-chan inputevent.Event, inputevent.Ctl, error) {
+	return nil, nil, errors.New("platform: input capture not implemented on this OS")
+}
+
+// NewCapturer returns a stub capturer for unsupported platforms.
+func NewCapturer() Capturer { return unsupportedCapturer{} }

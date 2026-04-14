@@ -8,13 +8,14 @@ import "github.com/titrom/rmouse/internal/proto"
 
 // Event is a flat sum type covering every kind of captured input.
 type Event struct {
-	Kind    Kind
-	DX, DY  int32             // Kind=MouseMove (relative)
-	Button  proto.MouseButton // Kind=MouseButton
-	Down    bool              // Kind=MouseButton or KeyEvent
-	WheelDX int16             // Kind=MouseWheel
-	WheelDY int16             // Kind=MouseWheel
-	KeyCode uint16            // Kind=KeyEvent (USB HID usage code)
+	Kind       Kind
+	AbsX, AbsY int32             // Kind=MouseMove — post-clamp screen position
+	DX, DY     int32             // Kind=MouseMove (relative, if available)
+	Button     proto.MouseButton // Kind=MouseButton
+	Down       bool              // Kind=MouseButton or KeyEvent
+	WheelDX    int16             // Kind=MouseWheel
+	WheelDY    int16             // Kind=MouseWheel
+	KeyCode    uint16            // Kind=KeyEvent (USB HID usage code)
 }
 
 // Kind tags the shape of an Event.
@@ -29,6 +30,13 @@ const (
 
 // Ctl toggles capture suppression. SetConsume(true) makes the capturer
 // swallow events locally while still delivering them to its channel.
+//
+// ClipToPoint and ReleaseClip lock / release the OS cursor to a single
+// pixel so the capturer keeps seeing relative deltas while the cursor is
+// "virtually" beyond the local screen edge. Implementations that can't
+// clip (e.g. Linux placeholder) may no-op.
 type Ctl interface {
 	SetConsume(on bool)
+	ClipToPoint(x, y int32) error
+	ReleaseClip() error
 }

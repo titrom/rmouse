@@ -1,6 +1,5 @@
 /bin/
 /dist/
-*.exe
 *.test
 *.prof
 *.log

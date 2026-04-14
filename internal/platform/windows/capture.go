@@ -23,17 +23,21 @@ type Capturer struct{}
 func NewCapturer() *Capturer { return &Capturer{} }
 
 var (
-	procSetWindowsHookExW    = user32.NewProc("SetWindowsHookExW")
-	procUnhookWindowsHookEx  = user32.NewProc("UnhookWindowsHookEx")
-	procCallNextHookEx       = user32.NewProc("CallNextHookEx")
-	procGetModuleHandleW     = kernel32.NewProc("GetModuleHandleW")
+	procSetWindowsHookExW   = user32.NewProc("SetWindowsHookExW")
+	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
+	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
+	procClipCursor          = user32.NewProc("ClipCursor")
+	procGetModuleHandleW    = kernel32.NewProc("GetModuleHandleW")
 )
+
+// LLMHF_INJECTED flag: set in MSLLHOOKSTRUCT.Flags for events we synthesized
+// ourselves (SetCursorPos, SendInput). We ignore those so the router's own
+// cursor pokes don't feed back into capture.
+const llmhfInjected = 0x00000001
 
 const (
 	whMouseLL    = 14
 	whKeyboardLL = 13
-
-	wmQuit = 0x0012
 
 	wmMouseMove    = 0x0200
 	wmLButtonDown  = 0x0201
@@ -89,18 +93,37 @@ type winMsg struct {
 type captureSession struct {
 	consume atomic.Bool
 	events  chan inputevent.Event
-
-	// State for synthesizing relative motion from absolute hook coords.
-	haveLast bool
-	lastX    int32
-	lastY    int32
 }
 
 func (s *captureSession) SetConsume(on bool) { s.consume.Store(on) }
 
+type winRect struct {
+	Left, Top, Right, Bottom int32
+}
+
+// ClipToPoint locks the OS cursor to a single pixel so Windows stops
+// clamping motion against a screen edge and we keep receiving deltas.
+func (*captureSession) ClipToPoint(x, y int32) error {
+	r := winRect{Left: x, Top: y, Right: x + 1, Bottom: y + 1}
+	ret, _, errno := procClipCursor.Call(uintptr(unsafe.Pointer(&r)))
+	if ret == 0 {
+		return fmt.Errorf("ClipCursor: %w", errno)
+	}
+	return nil
+}
+
+// ReleaseClip restores free cursor movement.
+func (*captureSession) ReleaseClip() error {
+	ret, _, errno := procClipCursor.Call(0)
+	if ret == 0 {
+		return fmt.Errorf("ClipCursor release: %w", errno)
+	}
+	return nil
+}
+
 // Capture installs the global hooks and returns a channel + controller. The
 // hooks are released when ctx is cancelled.
-func (*Capturer) Capture(ctx context.Context) (<-chan inputevent.Event, platform.CaptureCtl, error) {
+func (*Capturer) Capture(ctx context.Context) (<-chan inputevent.Event, inputevent.Ctl, error) {
 	sess := &captureSession{events: make(chan inputevent.Event, 256)}
 
 	type startResult struct {
@@ -181,45 +204,48 @@ func (s *captureSession) onMouseHook(code int32, wParam uintptr, lParam uintptr)
 		return r
 	}
 	data := (*msllHookStruct)(unsafe.Pointer(lParam))
+	if data.Flags&llmhfInjected != 0 {
+		// Event originated from SendInput / SetCursorPos — don't feed our
+		// own signals back into the router.
+		r, _, _ := procCallNextHookEx.Call(0, uintptr(code), wParam, lParam)
+		return r
+	}
 
 	switch uint32(wParam) {
 	case wmMouseMove:
-		if s.haveLast {
-			dx := data.Pt.X - s.lastX
-			dy := data.Pt.Y - s.lastY
-			if dx != 0 || dy != 0 {
-				s.emit(inputevent.Event{Kind: platform.KindMouseMove, DX: dx, DY: dy})
-			}
-		}
-		s.lastX, s.lastY, s.haveLast = data.Pt.X, data.Pt.Y, true
+		s.emit(inputevent.Event{
+			Kind: inputevent.MouseMove,
+			AbsX: data.Pt.X,
+			AbsY: data.Pt.Y,
+		})
 	case wmLButtonDown:
-		s.emit(inputevent.Event{Kind: platform.KindMouseButton, Button: proto.BtnLeft, Down: true})
+		s.emit(inputevent.Event{Kind: inputevent.MouseButton, Button: proto.BtnLeft, Down: true})
 	case wmLButtonUp:
-		s.emit(inputevent.Event{Kind: platform.KindMouseButton, Button: proto.BtnLeft, Down: false})
+		s.emit(inputevent.Event{Kind: inputevent.MouseButton, Button: proto.BtnLeft, Down: false})
 	case wmRButtonDown:
-		s.emit(inputevent.Event{Kind: platform.KindMouseButton, Button: proto.BtnRight, Down: true})
+		s.emit(inputevent.Event{Kind: inputevent.MouseButton, Button: proto.BtnRight, Down: true})
 	case wmRButtonUp:
-		s.emit(inputevent.Event{Kind: platform.KindMouseButton, Button: proto.BtnRight, Down: false})
+		s.emit(inputevent.Event{Kind: inputevent.MouseButton, Button: proto.BtnRight, Down: false})
 	case wmMButtonDown:
-		s.emit(inputevent.Event{Kind: platform.KindMouseButton, Button: proto.BtnMiddle, Down: true})
+		s.emit(inputevent.Event{Kind: inputevent.MouseButton, Button: proto.BtnMiddle, Down: true})
 	case wmMButtonUp:
-		s.emit(inputevent.Event{Kind: platform.KindMouseButton, Button: proto.BtnMiddle, Down: false})
+		s.emit(inputevent.Event{Kind: inputevent.MouseButton, Button: proto.BtnMiddle, Down: false})
 	case wmXButtonDown, wmXButtonUp:
 		btn := proto.BtnX1
 		if hiWord(data.MouseData) == 2 {
 			btn = proto.BtnX2
 		}
 		s.emit(inputevent.Event{
-			Kind:   platform.KindMouseButton,
+			Kind:   inputevent.MouseButton,
 			Button: btn,
 			Down:   uint32(wParam) == wmXButtonDown,
 		})
 	case wmMouseWheel:
 		delta := int16(hiWord(data.MouseData))
-		s.emit(inputevent.Event{Kind: platform.KindMouseWheel, WheelDY: delta / 120})
+		s.emit(inputevent.Event{Kind: inputevent.MouseWheel, WheelDY: delta / 120})
 	case wmMouseHWheel:
 		delta := int16(hiWord(data.MouseData))
-		s.emit(inputevent.Event{Kind: platform.KindMouseWheel, WheelDX: delta / 120})
+		s.emit(inputevent.Event{Kind: inputevent.MouseWheel, WheelDX: delta / 120})
 	}
 
 	if s.consume.Load() {
@@ -238,7 +264,7 @@ func (s *captureSession) onKeyHook(code int32, wParam uintptr, lParam uintptr) u
 	down := uint32(wParam) == wmKeyDown || uint32(wParam) == wmSysKeyDown
 
 	if hid, ok := vkToHID(uint16(data.VkCode)); ok {
-		s.emit(inputevent.Event{Kind: platform.KindKeyEvent, KeyCode: hid, Down: down})
+		s.emit(inputevent.Event{Kind: inputevent.KeyEvent, KeyCode: hid, Down: down})
 	}
 
 	if s.consume.Load() {

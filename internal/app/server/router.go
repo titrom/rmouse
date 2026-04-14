@@ -1,0 +1,364 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"sync"
+
+	"github.com/titrom/rmouse/internal/platform"
+	"github.com/titrom/rmouse/internal/platform/inputevent"
+	"github.com/titrom/rmouse/internal/proto"
+	"github.com/titrom/rmouse/internal/transport"
+)
+
+// Router owns the virtual-desktop cursor, decides when to "grab" (forward
+// input to a remote client) vs let events pass locally, and streams input
+// to the active client over its Session.
+//
+// M2 layout: each newly-registered client is placed immediately to the
+// right of the server's rightmost monitor, vertically aligned with the
+// top of the server's virtual desktop. Drag-and-drop editing comes later.
+type Router struct {
+	mu sync.Mutex
+
+	serverMons []proto.Monitor
+	serverMaxX int32 // right edge of the server's virtual desktop
+	serverMinY int32 // top edge (usually 0)
+
+	// Trap point: while grabbed, we repeatedly reset the OS cursor here so
+	// hardware motion keeps producing non-zero deltas even though the virtual
+	// cursor has "left the screen". Also used to initialise vx/vy.
+	trapX, trapY int32
+
+	clients map[ConnID]*routerClient
+
+	// Virtual cursor — updates as we consume capture events.
+	vx, vy int32
+
+	// Last known physical absolute position (for detecting edge pushing).
+	haveLastAbs       bool
+	lastAbsX, lastAbsY int32
+
+	active *routerClient
+
+	capturer platform.Capturer
+	injector platform.Injector
+}
+
+type routerClient struct {
+	id       ConnID
+	name     string
+	session  *transport.Session
+	monitors []proto.Monitor
+	// offsetX/offsetY is the virtual-space origin that the client's own
+	// top-left corner (minimum monitor X/Y) maps to.
+	offsetX, offsetY int32
+}
+
+// NewRouter captures the server's local monitor layout once, then accepts
+// client registrations over its lifetime. It does not start consuming
+// capture events until Run is called.
+func NewRouter(serverMons []proto.Monitor, capturer platform.Capturer, injector platform.Injector) *Router {
+	var maxX int32
+	var minY int32
+	var cx, cy int32
+	first := true
+	for _, m := range serverMons {
+		right := m.X + int32(m.W)
+		if first || right > maxX {
+			maxX = right
+		}
+		if first || m.Y < minY {
+			minY = m.Y
+		}
+		if m.Primary || first {
+			// Clip point = centre of the primary (or first) monitor.
+			cx = m.X + int32(m.W)/2
+			cy = m.Y + int32(m.H)/2
+		}
+		first = false
+	}
+	return &Router{
+		serverMons: serverMons,
+		serverMaxX: maxX,
+		serverMinY: minY,
+		trapX:      cx,
+		trapY:      cy,
+		clients:    map[ConnID]*routerClient{},
+		capturer:   capturer,
+		injector:   injector,
+	}
+}
+
+// Register adds a client to the routing table. Called from handleClient on
+// Hello. Safe to call concurrently with Run.
+func (r *Router) Register(id ConnID, name string, s *transport.Session, monitors []proto.Monitor) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c := &routerClient{id: id, name: name, session: s}
+	r.clients[id] = c
+	r.applyPlacement(c, monitors)
+}
+
+// UpdateMonitors replaces a client's monitor layout in response to a
+// MonitorsChanged message.
+func (r *Router) UpdateMonitors(id ConnID, monitors []proto.Monitor) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c, ok := r.clients[id]
+	if !ok {
+		return
+	}
+	r.applyPlacement(c, monitors)
+}
+
+// applyPlacement picks an offset so the client sits flush to the right of
+// the rightmost region currently occupied (server + previously-placed
+// clients), vertically aligned to the server's top edge.
+// Must be called with r.mu held.
+func (r *Router) applyPlacement(c *routerClient, monitors []proto.Monitor) {
+	c.monitors = append(c.monitors[:0], monitors...)
+	var cMinX, cMinY int32
+	first := true
+	for _, m := range monitors {
+		if first || m.X < cMinX {
+			cMinX = m.X
+		}
+		if first || m.Y < cMinY {
+			cMinY = m.Y
+		}
+		first = false
+	}
+	// Right-most "world" edge considering server + all other clients.
+	worldRight := r.serverMaxX
+	for _, other := range r.clients {
+		if other == c {
+			continue
+		}
+		for _, m := range other.monitors {
+			right := other.offsetX + m.X + int32(m.W)
+			if right > worldRight {
+				worldRight = right
+			}
+		}
+	}
+	c.offsetX = worldRight - cMinX
+	c.offsetY = r.serverMinY - cMinY
+}
+
+// Unregister removes a client from routing. If it was the grabbed client,
+// grab is released and capture is reset to pass-through.
+func (r *Router) Unregister(id ConnID, ctl inputevent.Ctl) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c, ok := r.clients[id]
+	if !ok {
+		return
+	}
+	if r.active == c {
+		r.active = nil
+		if ctl != nil {
+			ctl.SetConsume(false)
+		}
+		// Leave virtual cursor where it is — next mouse motion will place
+		// the physical cursor if needed.
+	}
+	delete(r.clients, id)
+}
+
+// Run starts capture and consumes events until ctx is cancelled. If
+// capture is unavailable on this platform, Run logs and returns — the
+// server still accepts clients, just without routing.
+func (r *Router) Run(ctx context.Context) error {
+	events, ctl, err := r.capturer.Capture(ctx)
+	if err != nil {
+		slog.Warn("input capture unavailable; server cannot route mouse/keys", "err", err)
+		return err
+	}
+	// Initialise virtual cursor at the trap point (centre of primary).
+	r.vx, r.vy = r.trapX, r.trapY
+
+	for {
+		select {
+		case <-ctx.Done():
+			ctl.SetConsume(false)
+			_ = ctl.ReleaseClip()
+			return ctx.Err()
+		case ev, ok := <-events:
+			if !ok {
+				return errors.New("capture channel closed")
+			}
+			r.handleEvent(ev, ctl)
+		}
+	}
+}
+
+func (r *Router) handleEvent(ev inputevent.Event, ctl inputevent.Ctl) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	switch ev.Kind {
+	case inputevent.MouseMove:
+		r.onMouseMove(ev.AbsX, ev.AbsY, ctl)
+	case inputevent.MouseButton:
+		if r.active != nil {
+			_ = r.active.session.Send(&proto.MouseButtonEvent{Button: ev.Button, Down: ev.Down})
+		}
+	case inputevent.MouseWheel:
+		if r.active != nil {
+			_ = r.active.session.Send(&proto.MouseWheel{DX: ev.WheelDX, DY: ev.WheelDY})
+		}
+	case inputevent.KeyEvent:
+		if r.active != nil {
+			_ = r.active.session.Send(&proto.KeyEvent{KeyCode: ev.KeyCode, Down: ev.Down})
+		}
+	}
+}
+
+// onMouseMove processes one absolute-position mouse event from capture.
+//
+// When not grabbed, the virtual cursor tracks the physical cursor
+// directly. If the physical cursor is sitting at the rightmost edge of the
+// server's desktop AND the OS reports the same position as the previous
+// event, we infer the user is pushing the mouse further right — Windows
+// can't move the cursor past the edge, but the hook still fires for
+// hardware motion. That's our cue to enter grab mode.
+//
+// Once grabbed, every event position is compared against the trap point.
+// The delta is the raw hardware motion since the previous event; we add
+// that to the virtual cursor, then reset the OS cursor to the trap so
+// the next event once again reflects a fresh hardware delta.
+func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
+	if r.active == nil {
+		// Not grabbed — virtual cursor follows the real cursor.
+		pushingEdge := r.haveLastAbs && absX == r.lastAbsX && absY == r.lastAbsY
+		if !pushingEdge {
+			r.vx, r.vy = absX, absY
+			r.lastAbsX, r.lastAbsY = absX, absY
+			r.haveLastAbs = true
+			return
+		}
+		// Cursor didn't move but a hardware event fired — pushing at a wall.
+		if absX >= r.serverMaxX-1 {
+			// Right edge: try to cross into a client placed to the right.
+			r.vx = r.serverMaxX
+			r.vy = absY
+			r.resolveRegion(ctl)
+			if r.active != nil {
+				// Grab succeeded — trap the physical cursor at centre so we
+				// keep getting non-zero deltas.
+				_ = r.injector.MouseMoveAbs(r.trapX, r.trapY)
+				r.lastAbsX, r.lastAbsY = r.trapX, r.trapY
+			}
+		}
+		return
+	}
+
+	// Grabbed mode: compute hardware delta relative to the trap point.
+	dx := absX - r.trapX
+	dy := absY - r.trapY
+	if dx == 0 && dy == 0 {
+		return
+	}
+	r.vx += dx
+	r.vy += dy
+	_ = r.injector.MouseMoveAbs(r.trapX, r.trapY)
+	r.lastAbsX, r.lastAbsY = r.trapX, r.trapY
+	r.resolveRegion(ctl)
+}
+
+// resolveRegion decides whether the virtual cursor is on the server or
+// inside a client and updates grab state accordingly. Caller must hold mu.
+func (r *Router) resolveRegion(ctl inputevent.Ctl) {
+	target := r.clientAt(r.vx, r.vy)
+	switch {
+	case target != nil && r.active == nil:
+		// Crossing from server into a client.
+		r.active = target
+		_ = target.session.Send(&proto.Grab{On: true})
+		r.sendAbs(target)
+		ctl.SetConsume(true)
+
+	case target == nil && r.active != nil:
+		// Returning to the server — restore local cursor at the boundary.
+		_ = r.active.session.Send(&proto.Grab{On: false})
+		r.active = nil
+		ctl.SetConsume(false)
+		// Clamp virtual cursor to server bounds so next grab re-enters cleanly.
+		r.vx, r.vy = clampToServer(r.vx, r.vy, r.serverMons)
+		_ = r.injector.MouseMoveAbs(r.vx, r.vy)
+		r.lastAbsX, r.lastAbsY = r.vx, r.vy
+
+	case target != nil && r.active != nil && target != r.active:
+		// Crossed between two clients.
+		_ = r.active.session.Send(&proto.Grab{On: false})
+		r.active = target
+		_ = target.session.Send(&proto.Grab{On: true})
+		r.sendAbs(target)
+
+	case target != nil && r.active != nil:
+		// Still in the same client — just update position.
+		r.sendAbs(target)
+	}
+}
+
+func (r *Router) sendAbs(c *routerClient) {
+	for _, m := range c.monitors {
+		left := c.offsetX + m.X
+		top := c.offsetY + m.Y
+		if r.vx >= left && r.vx < left+int32(m.W) &&
+			r.vy >= top && r.vy < top+int32(m.H) {
+			_ = c.session.Send(&proto.MouseAbs{
+				MonitorID: m.ID,
+				X:         uint16(r.vx - left),
+				Y:         uint16(r.vy - top),
+			})
+			return
+		}
+	}
+}
+
+func (r *Router) clientAt(x, y int32) *routerClient {
+	for _, c := range r.clients {
+		for _, m := range c.monitors {
+			left := c.offsetX + m.X
+			top := c.offsetY + m.Y
+			if x >= left && x < left+int32(m.W) && y >= top && y < top+int32(m.H) {
+				return c
+			}
+		}
+	}
+	return nil
+}
+
+func clampToServer(x, y int32, mons []proto.Monitor) (int32, int32) {
+	// If already inside a server monitor, return as-is.
+	for _, m := range mons {
+		if x >= m.X && x < m.X+int32(m.W) && y >= m.Y && y < m.Y+int32(m.H) {
+			return x, y
+		}
+	}
+	// Otherwise snap to the nearest edge point of the primary / first monitor.
+	if len(mons) == 0 {
+		return 0, 0
+	}
+	m := mons[0]
+	for _, c := range mons {
+		if c.Primary {
+			m = c
+			break
+		}
+	}
+	if x < m.X {
+		x = m.X
+	} else if x >= m.X+int32(m.W) {
+		x = m.X + int32(m.W) - 1
+	}
+	if y < m.Y {
+		y = m.Y
+	} else if y >= m.Y+int32(m.H) {
+		y = m.Y + int32(m.H) - 1
+	}
+	return x, y
+}

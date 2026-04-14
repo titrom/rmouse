@@ -9,3 +9,6 @@ func New() Display { return windows.New() }
 
 // NewInjector returns the OS-specific input injector for the current platform.
 func NewInjector() (Injector, error) { return windows.NewInjector() }
+
+// NewCapturer returns the OS-specific input capturer for the current platform.
+func NewCapturer() Capturer { return windows.NewCapturer() }

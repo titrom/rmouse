@@ -7,9 +7,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"log/slog"
 	"path/filepath"
 	"time"
 
+	"github.com/titrom/rmouse/internal/platform"
 	"github.com/titrom/rmouse/internal/proto"
 	"github.com/titrom/rmouse/internal/transport"
 )
@@ -117,8 +119,33 @@ func Run(ctx context.Context, cfg Config, sink func(Event)) error {
 		Token:    cfg.Token,
 	}
 
+	// Build the router so incoming clients can be registered as they connect.
+	// A failure to enumerate monitors or open the injector is not fatal:
+	// the server keeps running, just without local routing.
+	disp := platform.New()
+	serverMons, monErr := disp.Enumerate()
+	if monErr != nil {
+		slog.Warn("cannot enumerate local monitors; routing disabled", "err", monErr)
+	}
+	injector, injErr := platform.NewInjector()
+	if injErr != nil {
+		slog.Warn("cannot open input injector; routing disabled", "err", injErr)
+	}
+	capturer := platform.NewCapturer()
+
+	var router *Router
+	if monErr == nil && injErr == nil {
+		router = NewRouter(serverMons, capturer, injector)
+		go func() {
+			_ = router.Run(ctx)
+			if injector != nil {
+				_ = injector.Close()
+			}
+		}()
+	}
+
 	handler := func(s *transport.Session, hello *proto.Hello) {
-		handleClient(ctx, s, hello, sink)
+		handleClient(ctx, s, hello, router, sink)
 	}
 
 	if cfg.RelayAddr != "" {
@@ -135,7 +162,7 @@ func newConnID() ConnID {
 	return ConnID(hex.EncodeToString(b[:]))
 }
 
-func handleClient(ctx context.Context, s *transport.Session, hello *proto.Hello, sink func(Event)) {
+func handleClient(ctx context.Context, s *transport.Session, hello *proto.Hello, router *Router, sink func(Event)) {
 	id := newConnID()
 	remote := s.RemoteAddr().String()
 	name := hello.ClientName
@@ -144,6 +171,11 @@ func handleClient(ctx context.Context, s *transport.Session, hello *proto.Hello,
 	// Unblock s.Recv() immediately when the server shuts down instead of
 	// waiting up to 15 s for the read deadline to fire.
 	go func() { <-ctx.Done(); _ = s.Close() }()
+
+	if router != nil {
+		router.Register(id, name, s, hello.Monitors)
+		defer router.Unregister(id, nil)
+	}
 
 	for {
 		if ctx.Err() != nil {
@@ -170,6 +202,9 @@ func handleClient(ctx context.Context, s *transport.Session, hello *proto.Hello,
 			}
 		case *proto.MonitorsChanged:
 			sink(MonitorsChangedEvent{ID: id, RemoteAddr: remote, Name: name, Monitors: m.Monitors})
+			if router != nil {
+				router.UpdateMonitors(id, m.Monitors)
+			}
 		case *proto.Bye:
 			sink(ByeEvent{ID: id, RemoteAddr: remote, Name: name, Reason: m.Reason})
 			sink(ClientDisconnectedEvent{ID: id, RemoteAddr: remote, Name: name})
