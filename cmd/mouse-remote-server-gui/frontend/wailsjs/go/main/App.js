@@ -6,6 +6,14 @@ export function CertFingerprint() {
   return window['go']['main']['App']['CertFingerprint']();
 }
 
+export function GetPlacements() {
+  return window['go']['main']['App']['GetPlacements']();
+}
+
+export function GetServerMonitors() {
+  return window['go']['main']['App']['GetServerMonitors']();
+}
+
 export function IsRunning() {
   return window['go']['main']['App']['IsRunning']();
 }
@@ -16,6 +24,10 @@ export function LoadConfig() {
 
 export function SaveConfig(arg1) {
   return window['go']['main']['App']['SaveConfig'](arg1);
+}
+
+export function SetClientPlacement(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SetClientPlacement'](arg1, arg2, arg3);
 }
 
 export function Start(arg1) {

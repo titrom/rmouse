@@ -22,6 +22,19 @@ type Config struct {
 	Token     string
 	RelayAddr string // optional; when set, server dials the relay
 	Session   string // relay session id; required iff RelayAddr != ""
+
+	// Placements seeds the router's per-name cell grid. Typically loaded
+	// from a GUI-managed config file.
+	Placements map[string]Placement
+
+	// OnRouterReady, if non-nil, is called exactly once after the router
+	// is constructed. Gives the caller a handle so it can drive runtime
+	// edits (e.g. SetPlacement from drag-and-drop).
+	OnRouterReady func(*Router)
+
+	// OnPlacementChanged, if non-nil, is invoked whenever a client's
+	// placement is created or modified. Mirrored into the router.
+	OnPlacementChanged func(name string, p Placement)
 }
 
 // Event is a sum type of things Run reports.
@@ -42,6 +55,17 @@ type ServingViaRelayEvent struct {
 // transport RemoteAddr of every client is the same (the relay), so callers
 // need this to distinguish simultaneous clients.
 type ConnID string
+
+type ServerMonitorsEvent struct {
+	Monitors []proto.Monitor
+}
+
+type ClientPlacedEvent struct {
+	ID   ConnID
+	Name string
+	Col  int32
+	Row  int32
+}
 
 type ClientConnectedEvent struct {
 	ID         ConnID
@@ -80,7 +104,9 @@ type ByeEvent struct {
 
 func (ListeningEvent) isEvent()          {}
 func (ServingViaRelayEvent) isEvent()    {}
+func (ServerMonitorsEvent) isEvent()     {}
 func (ClientConnectedEvent) isEvent()    {}
+func (ClientPlacedEvent) isEvent()       {}
 func (MonitorsChangedEvent) isEvent()    {}
 func (ClientDisconnectedEvent) isEvent() {}
 func (RecvErrorEvent) isEvent()          {}
@@ -135,13 +161,19 @@ func Run(ctx context.Context, cfg Config, sink func(Event)) error {
 
 	var router *Router
 	if monErr == nil && injErr == nil {
-		router = NewRouter(serverMons, capturer, injector)
+		router = NewRouter(serverMons, capturer, injector, cfg.Placements, cfg.OnPlacementChanged)
+		if cfg.OnRouterReady != nil {
+			cfg.OnRouterReady(router)
+		}
 		go func() {
 			_ = router.Run(ctx)
 			if injector != nil {
 				_ = injector.Close()
 			}
 		}()
+	}
+	if monErr == nil {
+		sink(ServerMonitorsEvent{Monitors: serverMons})
 	}
 
 	handler := func(s *transport.Session, hello *proto.Hello) {
@@ -173,8 +205,9 @@ func handleClient(ctx context.Context, s *transport.Session, hello *proto.Hello,
 	go func() { <-ctx.Done(); _ = s.Close() }()
 
 	if router != nil {
-		router.Register(id, name, s, hello.Monitors)
-		defer router.Unregister(id, nil)
+		p := router.Register(id, name, s, hello.Monitors)
+		sink(ClientPlacedEvent{ID: id, Name: name, Col: p.Col, Row: p.Row})
+		defer router.Unregister(id)
 	}
 
 	for {

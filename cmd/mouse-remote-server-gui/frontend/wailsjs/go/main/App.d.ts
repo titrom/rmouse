@@ -4,11 +4,17 @@ import {main} from '../models';
 
 export function CertFingerprint():Promise<string>;
 
+export function GetPlacements():Promise<Array<main.PlacementDTO>>;
+
+export function GetServerMonitors():Promise<Array<main.MonitorDTO>>;
+
 export function IsRunning():Promise<boolean>;
 
 export function LoadConfig():Promise<main.ConfigDTO>;
 
 export function SaveConfig(arg1:main.ConfigDTO):Promise<void>;
+
+export function SetClientPlacement(arg1:string,arg2:number,arg3:number):Promise<void>;
 
 export function Start(arg1:main.ConfigDTO):Promise<void>;
 

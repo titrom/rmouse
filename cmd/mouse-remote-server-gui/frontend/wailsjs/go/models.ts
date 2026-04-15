@@ -18,6 +18,46 @@ export namespace main {
 	        this.session = source["session"];
 	    }
 	}
+	export class MonitorDTO {
+	    id: number;
+	    x: number;
+	    y: number;
+	    w: number;
+	    h: number;
+	    primary: boolean;
+	    name: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new MonitorDTO(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.x = source["x"];
+	        this.y = source["y"];
+	        this.w = source["w"];
+	        this.h = source["h"];
+	        this.primary = source["primary"];
+	        this.name = source["name"];
+	    }
+	}
+	export class PlacementDTO {
+	    name: string;
+	    col: number;
+	    row: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new PlacementDTO(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.col = source["col"];
+	        this.row = source["row"];
+	    }
+	}
 
 }
 

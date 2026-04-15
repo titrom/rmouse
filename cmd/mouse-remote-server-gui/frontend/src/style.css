@@ -1,279 +1,524 @@
-/* Theme is picked by a class that main.svelte adds to <body> on mount:
- *   .platform-windows / .platform-darwin → glass (Mica/vibrancy shows through)
- *   .platform-linux                      → solid libadwaita-style surfaces
- * Variables in :root are the Windows/Mac glass default; .platform-linux
- * overrides them. Light mode follows the system preference on each branch. */
+* { box-sizing: border-box; }
 
-* {
-  box-sizing: border-box;
-}
-
-:root {
-  --bg: transparent;
-  --fg: rgba(255, 255, 255, 0.92);
-  --fg-dim: rgba(255, 255, 255, 0.62);
-  --panel: rgba(255, 255, 255, 0.06);
-  --panel-strong: rgba(255, 255, 255, 0.1);
-  --panel-blur: blur(24px) saturate(180%);
-  --border: rgba(255, 255, 255, 0.12);
-  --border-hover: rgba(255, 255, 255, 0.22);
-  --accent: #7aa7ff;
-  --accent-strong: #5c8cff;
-  --accent-fg: #0a0f1d;
-  --ok: #6ee7a8;
-  --err: #ff8a8a;
-  --warn: #ffcc66;
-  --radius: 12px;
-  --radius-sm: 8px;
-  --font: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Display",
-    "Segoe UI", Roboto, Inter, "Helvetica Neue", sans-serif;
-  --font-mono: "SF Mono", "JetBrains Mono", "Consolas", monospace;
-}
-
-@media (prefers-color-scheme: light) {
-  :root {
-    --fg: rgba(20, 24, 40, 0.92);
-    --fg-dim: rgba(20, 24, 40, 0.55);
-    --panel: rgba(255, 255, 255, 0.45);
-    --panel-strong: rgba(255, 255, 255, 0.65);
-    --border: rgba(20, 24, 40, 0.1);
-    --border-hover: rgba(20, 24, 40, 0.2);
-  }
-}
-
-/* ---------- Linux: libadwaita-inspired native look ---------- */
-body.platform-linux {
-  --bg: #242424;
-  --fg: #ffffff;
-  --fg-dim: rgba(255, 255, 255, 0.6);
-  --panel: #303030;
-  --panel-strong: #3a3a3a;
-  --panel-blur: none;
-  --border: rgba(255, 255, 255, 0.1);
-  --border-hover: rgba(255, 255, 255, 0.18);
-  --accent: #62a0ea;
-  --accent-strong: #3584e4;
-  --accent-fg: #ffffff;
-  --font: "Inter", "Cantarell", "Ubuntu", system-ui, sans-serif;
-}
-
-@media (prefers-color-scheme: light) {
-  body.platform-linux {
-    --bg: #fafafa;
-    --fg: rgba(0, 0, 0, 0.87);
-    --fg-dim: rgba(0, 0, 0, 0.55);
-    --panel: #ffffff;
-    --panel-strong: #f0f0f0;
-    --border: rgba(0, 0, 0, 0.08);
-    --border-hover: rgba(0, 0, 0, 0.15);
-    --accent: #3584e4;
-    --accent-strong: #1c71d8;
-  }
-}
-
-body.platform-linux .panel {
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
-}
-
-body.platform-linux ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-body.platform-linux ::-webkit-scrollbar-track {
-  background: transparent;
-}
-body.platform-linux ::-webkit-scrollbar-thumb {
-  background: rgba(128, 128, 128, 0.4);
-  border-radius: 4px;
-}
-body.platform-linux ::-webkit-scrollbar-thumb:hover {
-  background: rgba(128, 128, 128, 0.6);
-}
-
-/* ---------- Shared ---------- */
-html, body, #app {
+html, body {
   margin: 0;
   padding: 0;
-  background: var(--bg);
-  color: var(--fg);
-  font-family: var(--font);
-  font-size: 14px;
-  line-height: 1.45;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 13px;
+  color: #1a1d26;
+  background: transparent;
 }
 
-#app {
-  min-height: 100vh;
-  padding: 20px;
+/* Restrained white-gray shimmer — slow conic + linear sweep gives the
+ * glass something to refract without introducing color. */
+.app {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  background:
+    linear-gradient(135deg, #e4e6ea 0%, #c2c6cd 50%, #d8dade 100%);
+  overflow: hidden;
+}
+.app::before {
+  content: "";
+  position: absolute;
+  inset: -25%;
+  background:
+    conic-gradient(from 0deg at 50% 50%,
+      #e8eaee 0deg,
+      #b4b8c0 90deg,
+      #d4d7dc 180deg,
+      #a8acb4 270deg,
+      #e8eaee 360deg);
+  filter: blur(80px);
+  opacity: 0.7;
+  animation: shimmer 18s linear infinite;
+  pointer-events: none;
+  z-index: 0;
+}
+.app > * { position: relative; z-index: 1; }
+@keyframes shimmer {
+  0%   { transform: rotate(0deg)   translate(0, 0); }
+  50%  { transform: rotate(180deg) translate(2%, -2%); }
+  100% { transform: rotate(360deg) translate(0, 0); }
 }
 
-.app-header {
+/* Liquid-glass surface: nearly colorless film, soft hairline border,
+ * heavy backdrop-blur. */
+.panel {
+  position: relative;
+  background:
+    linear-gradient(180deg,
+      rgba(255, 255, 255, 0.10) 0%,
+      rgba(255, 255, 255, 0.04) 50%,
+      rgba(255, 255, 255, 0.02) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 20px;
+  backdrop-filter: blur(30px) saturate(140%);
+  -webkit-backdrop-filter: blur(30px) saturate(140%);
+  padding: 18px;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.35) inset,
+    0 -1px 0 rgba(0, 0, 0, 0.08) inset,
+    0 8px 24px -12px rgba(0, 0, 0, 0.25);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.row-top {
+  display: flex;
+  gap: 16px;
+  flex: 0 0 400px;
+}
+
+.panel-listener {
+  width: 400px;
+  flex: 0 0 400px;
+}
+
+.panel-logs {
+  flex: 1;
+  min-width: 0;
+}
+
+.panel-screen {
+  flex: 1;
+  min-height: 0;
+}
+
+.zoom-ctrl {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.zoom-ctrl .link-btn {
+  min-width: 28px;
+  text-align: center;
+}
+.zoom-ctrl .sep {
+  display: inline-block;
+  width: 1px;
+  height: 12px;
+  background: rgba(0, 0, 0, 0.12);
+  margin: 0 4px;
+}
+
+.stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: rgba(255, 255, 255, 0.10);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.stage-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Monitor rectangle — glassy fill, hairline border, name + resolution
+ * centered. Primary is highlighted with a slightly stronger fill and an
+ * accent border so the user can tell it apart at a glance. */
+/* Same glass material as the panels — translucent film over a real
+ * backdrop-blur so the shimmer behind refracts through each screen. */
+.mon {
+  position: absolute;
+  background:
+    linear-gradient(180deg,
+      rgba(255, 255, 255, 0.14) 0%,
+      rgba(255, 255, 255, 0.05) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 6px;
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.40) inset,
+    0 -1px 0 rgba(0, 0, 0, 0.08) inset,
+    0 4px 12px -8px rgba(0, 0, 0, 0.25);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  transition: background 120ms, border-color 120ms;
+}
+.mon.primary {
+  background:
+    linear-gradient(180deg,
+      rgba(255, 255, 255, 0.22) 0%,
+      rgba(255, 255, 255, 0.08) 100%);
+  border-color: rgba(255, 255, 255, 0.32);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.50) inset,
+    0 -1px 0 rgba(0, 0, 0, 0.08) inset,
+    0 6px 16px -8px rgba(0, 0, 0, 0.30),
+    0 0 0 1px rgba(70, 110, 170, 0.28);
+}
+.mon-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  font-size: 11px;
+  color: #2a2e38;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.45);
+  padding: 4px 6px;
+  text-align: center;
+  line-height: 1.2;
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: none;
+}
+.mon-label strong {
+  font-weight: 600;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.mon-res {
+  font-family: 'SF Mono', Consolas, 'Liberation Mono', monospace;
+  font-size: 10px;
+  color: #5b606e;
+}
+
+/* Stub clients (synthetic, for layout testing) — dashed cool tint so the
+ * user can tell them apart from real ones at a glance. */
+.mon.mon-client.stub {
+  border-style: dashed;
+  border-color: rgba(255, 255, 255, 0.32);
+  background:
+    linear-gradient(180deg,
+      rgba(220, 230, 240, 0.18) 0%,
+      rgba(220, 230, 240, 0.06) 100%);
+  cursor: grab;
+}
+/* Live (real) clients — solid border, faint blue accent so they read as
+ * "actually connected"; same glass otherwise. */
+.mon.mon-client.live {
+  border-color: rgba(70, 110, 170, 0.40);
+  background:
+    linear-gradient(180deg,
+      rgba(220, 230, 245, 0.22) 0%,
+      rgba(220, 230, 245, 0.08) 100%);
+  cursor: grab;
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.40) inset,
+    0 -1px 0 rgba(0, 0, 0, 0.08) inset,
+    0 4px 12px -8px rgba(0, 0, 0, 0.25),
+    0 0 0 1px rgba(70, 110, 170, 0.18);
+}
+.mon.mon-client { cursor: grab; }
+/* While any client is settling, animate every monitor on the stage —
+ * server included — so a snap-induced re-fit (zoom/scale change) glides
+ * smoothly instead of snapping. */
+.stage.snapping .mon {
+  transition: left   320ms cubic-bezier(.22,.9,.32,1.0),
+              top    320ms cubic-bezier(.22,.9,.32,1.0),
+              width  320ms cubic-bezier(.22,.9,.32,1.0),
+              height 320ms cubic-bezier(.22,.9,.32,1.0);
+}
+.mon.mon-client.dragging,
+.mon.mon-client:active {
+  cursor: grabbing;
+  border-color: rgba(70, 110, 170, 0.55);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.45) inset,
+    0 -1px 0 rgba(0, 0, 0, 0.08) inset,
+    0 8px 18px -8px rgba(0, 0, 0, 0.40),
+    0 0 0 1px rgba(70, 110, 170, 0.30);
+}
+.mon-close {
+  appearance: none;
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.10);
+  background: rgba(255, 255, 255, 0.45);
+  color: #5b606e;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background 120ms, color 120ms;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+}
+.mon-close:hover { background: rgba(180, 70, 70, 0.30); color: #6e2a2a; }
+
+.link-btn {
+  appearance: none;
+  background: transparent;
+  border: none;
+  font: inherit;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #5b606e;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: color 120ms, background 120ms;
+}
+.link-btn:hover:not(:disabled) { color: #20232c; background: rgba(0, 0, 0, 0.04); }
+.link-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.log-box {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  background: rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-family: 'SF Mono', Consolas, 'Liberation Mono', monospace;
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+.log-box::-webkit-scrollbar { width: 8px; }
+.log-box::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.18);
+  border-radius: 4px;
+}
+.log-box::-webkit-scrollbar-thumb:hover { background: rgba(0, 0, 0, 0.28); }
+.log-box::-webkit-scrollbar-track { background: transparent; }
+
+.log-empty {
+  margin: 0;
+  color: #8a8f9c;
+  font-style: italic;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+.log-row {
+  display: flex;
+  gap: 8px;
+  padding: 1px 0;
+  color: #2a2e38;
+  border-left: 2px solid transparent;
+  padding-left: 6px;
+  margin-left: -8px;
+}
+.log-row.warn  { color: #6e5a2a; border-left-color: rgba(176, 138, 62, 0.55); }
+.log-row.error { color: #6e2a2a; border-left-color: rgba(150, 70, 70, 0.55); }
+.log-ts {
+  flex: 0 0 auto;
+  color: #8a8f9c;
+}
+.log-msg { word-break: break-word; }
+
+/* --- header ----------------------------------------------------------- */
+
+.panel-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 16px;
+  margin-bottom: 4px;
 }
-
-.app-title {
-  font-size: 18px;
+.panel-head h2 {
+  margin: 0;
+  font-size: 15px;
   font-weight: 600;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.1px;
+  color: #20232c;
 }
-
-.panel {
-  background: var(--panel);
-  backdrop-filter: var(--panel-blur);
-  -webkit-backdrop-filter: var(--panel-blur);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 16px 18px;
-  margin-bottom: 14px;
-}
-
-.panel-title {
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--fg-dim);
-  margin-bottom: 10px;
-}
-
-.row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 8px;
-}
-
-.row label {
-  width: 100px;
-  color: var(--fg-dim);
-  font-size: 13px;
-}
-
-input {
-  flex: 1;
-  padding: 7px 10px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: var(--panel-strong);
-  color: var(--fg);
-  font-family: inherit;
-  font-size: 13px;
-  outline: none;
-  transition: border-color 0.15s, box-shadow 0.15s;
-}
-
-input:focus {
-  border-color: var(--accent);
-}
-
-body.platform-linux input:focus {
-  box-shadow: 0 0 0 2px rgba(53, 132, 228, 0.25);
-}
-
-button {
-  padding: 8px 16px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: var(--panel-strong);
-  color: var(--fg);
-  font-family: inherit;
-  font-size: 13px;
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s;
-}
-
-button:hover:not(:disabled) {
-  border-color: var(--border-hover);
-}
-
-body.platform-windows button:hover:not(:disabled),
-body.platform-darwin button:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.15);
-}
-
-button.primary {
-  background: var(--accent-strong);
-  border-color: var(--accent-strong);
-  color: var(--accent-fg);
-  font-weight: 600;
-}
-
-button.primary:hover:not(:disabled) {
-  background: var(--accent);
-  border-color: var(--accent);
-}
-
-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.badge {
+.status {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 3px 10px;
-  border-radius: 999px;
-  font-size: 12px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #5b606e;
+}
+.status .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #8a8f9c;
+  box-shadow: 0 0 0 2px rgba(138, 143, 156, 0.18);
+}
+.status.on .dot {
+  background: #4a8f5a;
+  box-shadow: 0 0 0 2px rgba(74, 143, 90, 0.22);
+}
+.status.starting .dot {
+  background: #b08a3e;
+  box-shadow: 0 0 0 2px rgba(176, 138, 62, 0.22);
+}
+.detail {
+  margin: -4px 0 4px;
+  font-size: 11px;
+  color: #5b606e;
+}
+
+/* --- fields ----------------------------------------------------------- */
+
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field label {
+  font-size: 11px;
   font-weight: 500;
-  border: 1px solid var(--border);
-  background: var(--panel-strong);
+  color: #5b606e;
+  letter-spacing: 0.2px;
+}
+.field input {
+  appearance: none;
+  font: inherit;
+  color: #1a1d26;
+  background: rgba(255, 255, 255, 0.35);
+  border: 1px solid rgba(0, 0, 0, 0.10);
+  border-radius: 8px;
+  padding: 7px 10px;
+  outline: none;
+  transition: border-color 120ms, background 120ms;
+}
+.field input::placeholder { color: #9097a3; }
+.field input:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.45);
+}
+.field input:focus {
+  border-color: rgba(70, 110, 170, 0.55);
+  background: rgba(255, 255, 255, 0.55);
+  box-shadow: 0 0 0 3px rgba(70, 110, 170, 0.15);
+}
+.field input:disabled {
+  color: #6b6f7a;
+  background: rgba(255, 255, 255, 0.18);
+  cursor: not-allowed;
 }
 
-.badge.ok { color: var(--ok); border-color: rgba(110, 231, 168, 0.4); }
-.badge.err { color: var(--err); border-color: rgba(255, 138, 138, 0.4); }
-.badge.warn { color: var(--warn); border-color: rgba(255, 204, 102, 0.4); }
-.badge .dot {
-  width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+/* --- collapsible relay block ----------------------------------------- */
+
+.advanced {
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  padding-top: 10px;
+}
+.advanced summary {
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+  color: #5b606e;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  list-style: none;
+  outline: none;
+  user-select: none;
+  padding: 2px 0;
+}
+.advanced summary::-webkit-details-marker { display: none; }
+.advanced summary::before {
+  content: "▸ ";
+  display: inline-block;
+  margin-right: 2px;
+  transition: transform 120ms;
+}
+.advanced[open] summary::before { content: "▾ "; }
+.advanced .field { margin-top: 8px; }
+
+/* --- fingerprint ------------------------------------------------------ */
+
+.fp .fp-btn {
+  appearance: none;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.25);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 8px;
+  padding: 7px 10px;
+  color: #2a2e38;
+  transition: background 120ms;
+}
+.fp .fp-btn:hover { background: rgba(255, 255, 255, 0.40); }
+.fp code {
+  font-family: 'SF Mono', Consolas, 'Liberation Mono', monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.2px;
+  word-break: break-all;
+  display: block;
+  line-height: 1.4;
 }
 
-.kv {
-  display: grid;
-  grid-template-columns: 120px 1fr;
-  gap: 6px 12px;
-  font-size: 13px;
-}
+/* --- error ------------------------------------------------------------ */
 
-.kv .k { color: var(--fg-dim); }
-.kv .v { font-variant-numeric: tabular-nums; }
-
-.log {
-  max-height: 180px;
-  overflow-y: auto;
-  font-family: var(--font-mono);
+.error {
+  margin: 0;
+  padding: 8px 10px;
   font-size: 12px;
-  color: var(--fg-dim);
-  line-height: 1.5;
+  color: #6e2a2a;
+  background: rgba(180, 70, 70, 0.10);
+  border: 1px solid rgba(180, 70, 70, 0.20);
+  border-radius: 8px;
 }
 
-.log .line { margin: 0; padding: 1px 0; }
-.log .line.err { color: var(--err); }
-.log .line.ok { color: var(--ok); }
-.log .line.warn { color: var(--warn); }
+/* --- action buttons --------------------------------------------------- */
 
-.monitors {
-  width: 100%;
-  min-height: 160px;
-  background: rgba(0, 0, 0, 0.15);
-  border-radius: var(--radius-sm);
-  padding: 12px;
-  border: 1px solid var(--border);
+.actions {
+  margin-top: auto;
+  display: flex;
+  justify-content: flex-end;
 }
-
-body.platform-linux .monitors {
-  background: rgba(0, 0, 0, 0.18);
+/* Glass button — same material language as the panel: translucent fill,
+ * hairline border, soft inner highlight. Status conveyed by a tiny dot,
+ * not a saturated background. */
+.btn {
+  appearance: none;
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 8px 18px;
+  border-radius: 10px;
+  color: #20232c;
+  background:
+    linear-gradient(180deg,
+      rgba(255, 255, 255, 0.28) 0%,
+      rgba(255, 255, 255, 0.10) 100%);
+  border: 1px solid rgba(255, 255, 255, 0.30);
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.45) inset,
+    0 -1px 0 rgba(0, 0, 0, 0.06) inset,
+    0 4px 12px -6px rgba(0, 0, 0, 0.20);
+  transition: background 120ms, border-color 120ms, transform 80ms;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
-
-@media (prefers-color-scheme: light) {
-  body.platform-linux .monitors {
-    background: rgba(0, 0, 0, 0.04);
-  }
+.btn:hover:not(:disabled) {
+  background:
+    linear-gradient(180deg,
+      rgba(255, 255, 255, 0.40) 0%,
+      rgba(255, 255, 255, 0.18) 100%);
+  border-color: rgba(255, 255, 255, 0.45);
 }
-
-.monitor-label {
-  fill: var(--fg-dim);
-  font-size: 10px;
-  font-family: var(--font-mono);
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:disabled { cursor: not-allowed; opacity: 0.50; }
+.btn::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #8a8f9c;
 }
+.btn.primary::before { background: #4a8f5a; }
+.btn.danger::before { background: #b06262; }
