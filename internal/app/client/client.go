@@ -229,7 +229,6 @@ func runOnce(ctx context.Context, cfg Config, mons *monitorStore, injector platf
 	if err != nil {
 		return err
 	}
-	defer sess.Close()
 	sink(StatusEvent{State: StateConnected, AssignedName: welcome.AssignedName})
 
 	updates, unsubscribe := mons.subscribe()
@@ -238,10 +237,28 @@ func runOnce(ctx context.Context, cfg Config, mons *monitorStore, injector platf
 	ticker := time.NewTicker(cfg.PingInterval)
 	defer ticker.Stop()
 
+	// injected tracks everything we've pushed to the local injector as a
+	// DOWN event that hasn't been matched by a corresponding UP yet. If the
+	// session dies mid-drag (or the server's release message is lost) the
+	// local OS would otherwise keep those buttons/keys latched.
+	injected := newInjectedState()
+	readerDone := make(chan struct{})
+
+	defer func() {
+		// Close first so the reader's Recv unblocks, then wait for it to
+		// finish so releaseAll sees a stable snapshot. Only then release —
+		// injecting UPs while the reader could still be applying DOWNs for
+		// the same input would race.
+		_ = sess.Close()
+		<-readerDone
+		injected.releaseAll(injector)
+	}()
+
 	errs := make(chan error, 2)
 	seq := uint32(0)
 
 	go func() {
+		defer close(readerDone)
 		for {
 			_ = sess.SetReadDeadline(time.Now().Add(3 * cfg.PingInterval))
 			msg, err := sess.Recv()
@@ -249,7 +266,7 @@ func runOnce(ctx context.Context, cfg Config, mons *monitorStore, injector platf
 				errs <- err
 				return
 			}
-			dispatchIncoming(msg, injector, mons, sink)
+			dispatchIncoming(msg, injector, mons, sink, injected)
 		}
 	}()
 
@@ -276,12 +293,22 @@ func runOnce(ctx context.Context, cfg Config, mons *monitorStore, injector platf
 // dispatchIncoming routes a received message. Pong is surfaced as a status
 // event; input messages are handed to the injector (if available). Unknown
 // messages are ignored so future protocol additions don't break old clients.
-func dispatchIncoming(msg proto.Message, injector platform.Injector, mons *monitorStore, sink func(Event)) {
+// injected tracks DOWN events we've applied so we can release them if the
+// session drops without matching UPs.
+func dispatchIncoming(msg proto.Message, injector platform.Injector, mons *monitorStore, sink func(Event), injected *injectedState) {
 	switch m := msg.(type) {
 	case *proto.Pong:
 		sink(PongEvent{Seq: m.Seq})
 	case *proto.Grab:
 		sink(GrabEvent{On: m.On})
+		if !m.On {
+			// Server says we no longer own the cursor. The server itself
+			// sends UP for every button / key it forwarded DOWN, but if
+			// those messages were lost (dropped at transport shutdown) the
+			// local OS would stay latched. Defensive sweep on every
+			// Grab{Off}.
+			injected.releaseAll(injector)
+		}
 	case *proto.MouseMove:
 		if injector != nil {
 			_ = injector.MouseMoveRel(int32(m.DX), int32(m.DY))
@@ -295,7 +322,9 @@ func dispatchIncoming(msg proto.Message, injector platform.Injector, mons *monit
 		}
 	case *proto.MouseButtonEvent:
 		if injector != nil {
-			_ = injector.MouseButton(m.Button, m.Down)
+			if err := injector.MouseButton(m.Button, m.Down); err == nil {
+				injected.noteButton(m.Button, m.Down)
+			}
 		}
 	case *proto.MouseWheel:
 		if injector != nil {
@@ -303,8 +332,76 @@ func dispatchIncoming(msg proto.Message, injector platform.Injector, mons *monit
 		}
 	case *proto.KeyEvent:
 		if injector != nil {
-			_ = injector.KeyEvent(m.KeyCode, m.Down)
+			if err := injector.KeyEvent(m.KeyCode, m.Down); err == nil {
+				injected.noteKey(m.KeyCode, m.Down)
+			}
 		}
+	}
+}
+
+// injectedState tracks mouse buttons and keyboard keys that the client has
+// applied to the local OS as DOWN events and not yet released. It exists so
+// the client can release everything on session death — otherwise a drag or
+// latched modifier active when the TLS connection dropped would stay stuck
+// in the OS until the user cycled that input manually.
+type injectedState struct {
+	mu   sync.Mutex
+	btns map[proto.MouseButton]bool
+	keys map[uint16]bool
+}
+
+func newInjectedState() *injectedState {
+	return &injectedState{
+		btns: map[proto.MouseButton]bool{},
+		keys: map[uint16]bool{},
+	}
+}
+
+func (s *injectedState) noteButton(btn proto.MouseButton, down bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if down {
+		s.btns[btn] = true
+	} else {
+		delete(s.btns, btn)
+	}
+}
+
+func (s *injectedState) noteKey(hid uint16, down bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if down {
+		s.keys[hid] = true
+	} else {
+		delete(s.keys, hid)
+	}
+}
+
+// releaseAll sends UP for every currently-tracked input through injector,
+// then clears the state. Caller is responsible for ensuring no concurrent
+// note*/dispatchIncoming is running — racing releases with fresh DOWNs
+// would leave state desynced.
+func (s *injectedState) releaseAll(injector platform.Injector) {
+	s.mu.Lock()
+	btns := make([]proto.MouseButton, 0, len(s.btns))
+	for b := range s.btns {
+		btns = append(btns, b)
+	}
+	keys := make([]uint16, 0, len(s.keys))
+	for k := range s.keys {
+		keys = append(keys, k)
+	}
+	s.btns = map[proto.MouseButton]bool{}
+	s.keys = map[uint16]bool{}
+	s.mu.Unlock()
+	if injector == nil {
+		return
+	}
+	for _, b := range btns {
+		_ = injector.MouseButton(b, false)
+	}
+	for _, k := range keys {
+		_ = injector.KeyEvent(k, false)
 	}
 }
 

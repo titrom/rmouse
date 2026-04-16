@@ -61,6 +61,25 @@ type Router struct {
 	haveLastAbs       bool
 	lastAbsX, lastAbsY int32
 
+	// heldBtns is the set of mouse buttons the user currently holds down,
+	// tracked from hook events. Used on grab-in to release the server OS's
+	// view of those buttons so a drag started on the server doesn't stay
+	// stuck when the cursor leaves.
+	heldBtns map[proto.MouseButton]bool
+	// btnsOnClient is the set of buttons we've forwarded as DOWN to the
+	// currently-grabbed client. Used to release them on grab-off so a drag
+	// started on the client doesn't stay stuck when the cursor returns to
+	// the server, and to skip forwarding UP events for buttons the client
+	// never saw DOWN for.
+	btnsOnClient map[proto.MouseButton]bool
+	// heldKeys / keysOnClient mirror the button-tracking maps above, but for
+	// keyboard events. Keyed by HID usage code. Without these, a modifier
+	// held during a grab-in (e.g. Ctrl pressed on server before crossing)
+	// would stay logically pressed on the client until the user cycles it
+	// there manually.
+	heldKeys     map[uint16]bool
+	keysOnClient map[uint16]bool
+
 	active *routerClient
 
 	capturer platform.Capturer
@@ -134,6 +153,10 @@ func NewRouter(serverMons []proto.Monitor, capturer platform.Capturer, injector 
 		onPlacementChanged: onPlacementChanged,
 		capturer:           capturer,
 		injector:           injector,
+		heldBtns:           map[proto.MouseButton]bool{},
+		btnsOnClient:       map[proto.MouseButton]bool{},
+		heldKeys:           map[uint16]bool{},
+		keysOnClient:       map[uint16]bool{},
 	}
 }
 
@@ -284,6 +307,15 @@ func (r *Router) Unregister(id ConnID) {
 		return
 	}
 	if r.active == c {
+		// Session is going away — can't deliver UPs over the wire. Drop
+		// state; the client is responsible for releasing any still-held
+		// inputs locally when its session dies.
+		for btn := range r.btnsOnClient {
+			delete(r.btnsOnClient, btn)
+		}
+		for hid := range r.keysOnClient {
+			delete(r.keysOnClient, hid)
+		}
 		r.active = nil
 		if r.ctl != nil {
 			r.ctl.SetConsume(false)
@@ -341,16 +373,45 @@ func (r *Router) handleEvent(ev inputevent.Event, ctl inputevent.Ctl) {
 	case inputevent.MouseMove:
 		r.onMouseMove(ev.AbsX, ev.AbsY, ctl)
 	case inputevent.MouseButton:
+		if ev.Down {
+			r.heldBtns[ev.Button] = true
+		} else {
+			delete(r.heldBtns, ev.Button)
+		}
 		if r.active != nil {
-			_ = r.active.session.Send(&proto.MouseButtonEvent{Button: ev.Button, Down: ev.Down})
+			if ev.Down {
+				_ = r.active.session.Send(&proto.MouseButtonEvent{Button: ev.Button, Down: true})
+				r.btnsOnClient[ev.Button] = true
+			} else if r.btnsOnClient[ev.Button] {
+				// Only forward UP if we forwarded the matching DOWN — otherwise
+				// the client gets a spurious up event (e.g. for a button the
+				// user pressed on the server before grab-in and we released on
+				// grab-in by injecting UP locally).
+				_ = r.active.session.Send(&proto.MouseButtonEvent{Button: ev.Button, Down: false})
+				delete(r.btnsOnClient, ev.Button)
+			}
 		}
 	case inputevent.MouseWheel:
 		if r.active != nil {
 			_ = r.active.session.Send(&proto.MouseWheel{DX: ev.WheelDX, DY: ev.WheelDY})
 		}
 	case inputevent.KeyEvent:
+		if ev.Down {
+			r.heldKeys[ev.KeyCode] = true
+		} else {
+			delete(r.heldKeys, ev.KeyCode)
+		}
 		if r.active != nil {
-			_ = r.active.session.Send(&proto.KeyEvent{KeyCode: ev.KeyCode, Down: ev.Down})
+			if ev.Down {
+				_ = r.active.session.Send(&proto.KeyEvent{KeyCode: ev.KeyCode, Down: true})
+				r.keysOnClient[ev.KeyCode] = true
+			} else if r.keysOnClient[ev.KeyCode] {
+				// Same rule as buttons: suppress spurious UP for a key the
+				// client never saw DOWN for (e.g. Ctrl pressed on server
+				// before grab-in and released on server by injecting UP).
+				_ = r.active.session.Send(&proto.KeyEvent{KeyCode: ev.KeyCode, Down: false})
+				delete(r.keysOnClient, ev.KeyCode)
+			}
 		}
 	}
 }
@@ -485,6 +546,27 @@ func (r *Router) resolveRegion(ctl inputevent.Ctl) {
 	switch {
 	case target != nil && r.active == nil:
 		// Crossing from server into a client.
+		// Release any buttons / keys the user is physically holding: the
+		// server's OS saw the DOWN events before the grab and is mid-drag
+		// or has a modifier latched, but the cursor is about to leave.
+		// Without releasing, that state stays stuck on the server.
+		if r.injector != nil {
+			for btn := range r.heldBtns {
+				_ = r.injector.MouseButton(btn, false)
+			}
+			for hid := range r.heldKeys {
+				_ = r.injector.KeyEvent(hid, false)
+			}
+		}
+		// btnsOnClient / keysOnClient should already be empty (no active
+		// client), but clear them so we don't carry ghost state into the
+		// new grab.
+		for btn := range r.btnsOnClient {
+			delete(r.btnsOnClient, btn)
+		}
+		for hid := range r.keysOnClient {
+			delete(r.keysOnClient, hid)
+		}
 		r.active = target
 		_ = target.session.Send(&proto.Grab{On: true})
 		r.sendAbs(target)
@@ -499,6 +581,17 @@ func (r *Router) resolveRegion(ctl inputevent.Ctl) {
 		// Returning to the server — restore local cursor at the boundary.
 		releasedFrom := r.active.name
 		preClampVX, preClampVY := r.vx, r.vy
+		// Release any buttons / keys we forwarded as DOWN to the client.
+		// Without this, a drag or held modifier started on the client stays
+		// stuck when the user crosses back to the server.
+		for btn := range r.btnsOnClient {
+			_ = r.active.session.Send(&proto.MouseButtonEvent{Button: btn, Down: false})
+			delete(r.btnsOnClient, btn)
+		}
+		for hid := range r.keysOnClient {
+			_ = r.active.session.Send(&proto.KeyEvent{KeyCode: hid, Down: false})
+			delete(r.keysOnClient, hid)
+		}
 		_ = r.active.session.Send(&proto.Grab{On: false})
 		r.active = nil
 		ctl.SetConsume(false)
@@ -518,8 +611,18 @@ func (r *Router) resolveRegion(ctl inputevent.Ctl) {
 			"vParked", fmt.Sprintf("(%d,%d)", r.vx, r.vy))
 
 	case target != nil && r.active != nil && target != r.active:
-		// Crossed between two clients.
+		// Crossed between two clients. Release buttons and keys on the old
+		// client so a drag or held modifier there doesn't stay stuck after
+		// we switch.
 		from := r.active.name
+		for btn := range r.btnsOnClient {
+			_ = r.active.session.Send(&proto.MouseButtonEvent{Button: btn, Down: false})
+			delete(r.btnsOnClient, btn)
+		}
+		for hid := range r.keysOnClient {
+			_ = r.active.session.Send(&proto.KeyEvent{KeyCode: hid, Down: false})
+			delete(r.keysOnClient, hid)
+		}
 		_ = r.active.session.Send(&proto.Grab{On: false})
 		r.active = target
 		_ = target.session.Send(&proto.Grab{On: true})
@@ -565,13 +668,11 @@ func (r *Router) clientAt(x, y int32) *routerClient {
 // grabHysteresis is the pixel buffer applied on grab transitions. On cross-in
 // the virtual cursor is pushed this far past the boundary so subsequent
 // motion doesn't immediately exit; on release it is parked this far inside
-// server bounds for the symmetric reason. Bumped to 500 — a fast flick at
-// 3200 DPI / 1000 Hz can push hundreds of pixels in a single hook event,
-// and 100 was visibly insufficient (corner-twitch on irregular layouts).
-// Upper bound is set by the smallest expected client/server monitor side:
-// 500 leaves ≥700 px of headroom inside any 1200-tall client (e.g. eDP-1
-// 1920×1200), so the projected vy is safely interior.
-const grabHysteresis int32 = 500
+// server bounds for the symmetric reason. Kept small so the visible jump at
+// the seam is barely perceptible — the edge-push detector (two consecutive
+// at-wall hook samples) already absorbs normal mouse jitter, so a large
+// spatial buffer is redundant for jitter and just hurts smoothness.
+const grabHysteresis int32 = 30
 
 // padInsideServer pulls (x, y) at least grabHysteresis pixels away from any
 // server bbox edge it sits at. Used after releasing grab so the next at-edge
