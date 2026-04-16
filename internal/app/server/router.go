@@ -223,25 +223,54 @@ func (r *Router) ensurePlacement(name string) (Placement, bool) {
 	return p, true
 }
 
-// applyPlacementAt positions the client so its bounding box sits in the
-// (col,row) cell of the server-sized grid. Must be called with r.mu held.
+// applyPlacementAt positions the client adjacent to the server's bounding
+// box: col=+1 puts the client's left edge flush against serverMaxX, col=-1
+// puts its right edge flush against serverMinX, col=0 aligns its left with
+// serverMinX (rows analogous). The earlier "one server-bbox per cell"
+// formula left a gap of (cellSize - clientSize) on negative cells, so the
+// push-projection landing point (serverMinY - hyst, etc.) fell into empty
+// space and clientAt missed the client. Edge-aligned placement guarantees
+// the projection lands grabHysteresis pixels inside the client's rect.
+// Must be called with r.mu held.
 func (r *Router) applyPlacementAt(c *routerClient, monitors []proto.Monitor, p Placement) {
 	c.monitors = append(c.monitors[:0], monitors...)
-	var cMinX, cMinY int32
+	var cMinX, cMinY, cMaxX, cMaxY int32
 	first := true
 	for _, m := range monitors {
-		if first || m.X < cMinX {
-			cMinX = m.X
+		l := m.X
+		rgt := m.X + int32(m.W)
+		t := m.Y
+		b := m.Y + int32(m.H)
+		if first || l < cMinX {
+			cMinX = l
 		}
-		if first || m.Y < cMinY {
-			cMinY = m.Y
+		if first || rgt > cMaxX {
+			cMaxX = rgt
+		}
+		if first || t < cMinY {
+			cMinY = t
+		}
+		if first || b > cMaxY {
+			cMaxY = b
 		}
 		first = false
 	}
-	sw := r.serverMaxX - r.serverMinX
-	sh := r.serverMaxY - r.serverMinY
-	c.offsetX = r.serverMinX + p.Col*sw - cMinX
-	c.offsetY = r.serverMinY + p.Row*sh - cMinY
+	switch {
+	case p.Col > 0:
+		c.offsetX = r.serverMaxX - cMinX
+	case p.Col < 0:
+		c.offsetX = r.serverMinX - cMaxX
+	default:
+		c.offsetX = r.serverMinX - cMinX
+	}
+	switch {
+	case p.Row > 0:
+		c.offsetY = r.serverMaxY - cMinY
+	case p.Row < 0:
+		c.offsetY = r.serverMinY - cMaxY
+	default:
+		c.offsetY = r.serverMinY - cMinY
+	}
 }
 
 // Unregister removes a client from routing. If it was the grabbed client,
@@ -345,18 +374,29 @@ func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
 		// Not grabbed — virtual cursor follows the real cursor.
 		// Edge-pushing detection: the OS clamps the cursor at the desktop
 		// boundary, so any continued hardware motion against the wall lands
-		// at the same absolute coord. We previously required the *whole*
-		// position to be unchanged (absX & absY both equal to last), which
-		// failed on a low-DPI / slow-handed mouse where the perpendicular
-		// axis often inches by ±1px between hook events. Now: an axis is
-		// "stuck against its edge" if both this event AND the previous one
-		// sit at that bound, regardless of the other axis. Cross only after
-		// two consecutive at-edge samples so a single edge-touch on normal
-		// pointing doesn't trigger a stray grab.
-		pushRight := absX >= r.serverMaxX-1 && r.haveLastAbs && r.lastAbsX >= r.serverMaxX-1
-		pushLeft := absX <= r.serverMinX && r.haveLastAbs && r.lastAbsX <= r.serverMinX
-		pushBot := absY >= r.serverMaxY-1 && r.haveLastAbs && r.lastAbsY >= r.serverMaxY-1
-		pushTop := absY <= r.serverMinY && r.haveLastAbs && r.lastAbsY <= r.serverMinY
+		// at the same absolute coord. With an irregular multi-monitor server
+		// (e.g. a 1920×1080 secondary sitting beside a taller primary) the
+		// "wall" is the boundary of the *union* of monitors, not just the
+		// outer bbox — pushing down off the secondary is a real edge even
+		// though absY < serverMaxY. So we ask: is (absX±1, absY±1) inside
+		// any server monitor? If not, that direction is clamped. Cross only
+		// after two consecutive at-edge samples so a single edge-touch on
+		// normal pointing doesn't trigger a stray grab.
+		atRight := !anyServerMonContains(r.serverMons, absX+1, absY)
+		atLeft := !anyServerMonContains(r.serverMons, absX-1, absY)
+		atBot := !anyServerMonContains(r.serverMons, absX, absY+1)
+		atTop := !anyServerMonContains(r.serverMons, absX, absY-1)
+		var lastAtRight, lastAtLeft, lastAtBot, lastAtTop bool
+		if r.haveLastAbs {
+			lastAtRight = !anyServerMonContains(r.serverMons, r.lastAbsX+1, r.lastAbsY)
+			lastAtLeft = !anyServerMonContains(r.serverMons, r.lastAbsX-1, r.lastAbsY)
+			lastAtBot = !anyServerMonContains(r.serverMons, r.lastAbsX, r.lastAbsY+1)
+			lastAtTop = !anyServerMonContains(r.serverMons, r.lastAbsX, r.lastAbsY-1)
+		}
+		pushRight := atRight && lastAtRight
+		pushLeft := atLeft && lastAtLeft
+		pushBot := atBot && lastAtBot
+		pushTop := atTop && lastAtTop
 		// On grab-in we project the virtual cursor grabHysteresis pixels
 		// *past* the boundary, not exactly at it. A wireless mouse jitters
 		// ±1–2px between hook samples; landing exactly on the boundary
@@ -548,6 +588,18 @@ func padInsideServer(x, y, minX, maxX, minY, maxY int32) (int32, int32) {
 		y = minY + grabHysteresis
 	}
 	return x, y
+}
+
+// anyServerMonContains reports whether (x, y) lies inside any server monitor.
+// Used by the edge-push detector to decide if stepping one pixel further in
+// some direction would still land on a real screen.
+func anyServerMonContains(mons []proto.Monitor, x, y int32) bool {
+	for _, m := range mons {
+		if x >= m.X && x < m.X+int32(m.W) && y >= m.Y && y < m.Y+int32(m.H) {
+			return true
+		}
+	}
+	return false
 }
 
 func clampToServer(x, y int32, mons []proto.Monitor) (int32, int32) {

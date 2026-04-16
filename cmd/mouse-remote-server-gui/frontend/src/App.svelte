@@ -51,15 +51,24 @@
     stubClients = stubClients;
   }
   // Mirror internal/app/server/router.go::applyPlacementAt so the visual
-  // offset matches where the router will actually send the cursor.
+  // offset matches where the router will actually send the cursor. Edge-
+  // aligned: col=+1 puts the client's left flush against serverMaxX,
+  // col=-1 its right against serverMinX, col=0 its left against serverMinX
+  // (rows analogous). The earlier "one server-bbox per cell" formula left
+  // a gap on negative cells that broke cursor handoff into above/left
+  // clients.
   function liveOffsetFromCell(c: LiveClient) {
     if (monitors.length === 0 || c.monitors.length === 0) return;
-    const sw = serverBbox.maxX - serverBbox.minX || 1;
-    const sh = serverBbox.maxY - serverBbox.minY || 1;
     const cMinX = Math.min(...c.monitors.map(m => m.x));
     const cMinY = Math.min(...c.monitors.map(m => m.y));
-    c.offX = serverBbox.minX + c.col * sw - cMinX;
-    c.offY = serverBbox.minY + c.row * sh - cMinY;
+    const cMaxX = Math.max(...c.monitors.map(m => m.x + m.w));
+    const cMaxY = Math.max(...c.monitors.map(m => m.y + m.h));
+    c.offX = c.col > 0 ? serverBbox.maxX - cMinX
+           : c.col < 0 ? serverBbox.minX - cMaxX
+           : serverBbox.minX - cMinX;
+    c.offY = c.row > 0 ? serverBbox.maxY - cMinY
+           : c.row < 0 ? serverBbox.minY - cMaxY
+           : serverBbox.minY - cMinY;
   }
   let nextStubId = 1;
   function addTestClient() {
@@ -207,27 +216,25 @@
       c.offX = p.x;
       c.offY = p.y;
       if (zoom !== 1) zoom = 1;
-      // Live clients persist via the router's (col, row) cell grid. We
-      // round the snapped offset back into a cell, push it to Go, and
-      // realign offX/offY to the router's exact formula so what the
-      // user sees is what the cursor will follow.
+      // Live clients persist via the router's (col, row) cell grid. The
+      // snap above already produced an edge-aligned offset, so we infer
+      // the cell from which side of the server bbox the client's midpoint
+      // landed on. Then liveOffsetFromCell re-derives offX/offY using the
+      // exact same formula as the router so the visual matches the cursor
+      // landing point.
       if (c.kind === "live") {
-        const sw = serverBbox.maxX - serverBbox.minX || 1;
-        const sh = serverBbox.maxY - serverBbox.minY || 1;
-        let col = Math.round((c.offX + cMinX - serverBbox.minX) / sw);
-        let row = Math.round((c.offY + cMinY - serverBbox.minY) / sh);
+        const midX = c.offX + (cMinX + cMaxX) / 2;
+        const midY = c.offY + (cMinY + cMaxY) / 2;
+        let col = midX >= serverBbox.maxX ? 1 : midX <= serverBbox.minX ? -1 : 0;
+        let row = midY >= serverBbox.maxY ? 1 : midY <= serverBbox.minY ? -1 : 0;
         // Cardinal-flush only: zero out the smaller axis so col=±1,row=0 or
-        // col=0,row=±1, matching the cardinal-only anchor set above. This
-        // prevents diagonal placements that would route the cursor past a
+        // col=0,row=±1. Diagonal placements would route the cursor past a
         // client whose monitor rect doesn't intersect the edge being pushed.
         if (col !== 0 && row !== 0) {
-          if (Math.abs(col) >= Math.abs(row)) row = 0;
-          else col = 0;
+          const dx = col > 0 ? midX - serverBbox.maxX : serverBbox.minX - midX;
+          const dy = row > 0 ? midY - serverBbox.maxY : serverBbox.minY - midY;
+          if (dx >= dy) row = 0; else col = 0;
         }
-        // Clamp magnitude to 1 — placement further out than one cell yields
-        // a gap the router can never bridge from a side edge.
-        col = Math.max(-1, Math.min(1, col));
-        row = Math.max(-1, Math.min(1, row));
         if (col === 0 && row === 0) col = 1; // (0,0) is reserved for the server.
         c.col = col;
         c.row = row;
