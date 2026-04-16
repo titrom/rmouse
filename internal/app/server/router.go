@@ -263,6 +263,7 @@ func (r *Router) Unregister(id ConnID) {
 		r.vx, r.vy = clampToServer(r.vx, r.vy, r.serverMons)
 		if r.injector != nil {
 			_ = r.injector.MouseMoveAbs(r.vx, r.vy)
+			_ = r.injector.SetCursorVisible(true)
 		}
 		r.lastAbsX, r.lastAbsY = r.vx, r.vy
 	}
@@ -289,6 +290,9 @@ func (r *Router) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			ctl.SetConsume(false)
 			_ = ctl.ReleaseClip()
+			if r.injector != nil {
+				_ = r.injector.SetCursorVisible(true)
+			}
 			return ctx.Err()
 		case ev, ok := <-events:
 			if !ok {
@@ -384,6 +388,9 @@ func (r *Router) resolveRegion(ctl inputevent.Ctl) {
 		_ = target.session.Send(&proto.Grab{On: true})
 		r.sendAbs(target)
 		ctl.SetConsume(true)
+		// Hide the host cursor: while grabbed it sits parked at the trap point
+		// and would otherwise hover visibly in the centre of the screen.
+		_ = r.injector.SetCursorVisible(false)
 
 	case target == nil && r.active != nil:
 		// Returning to the server — restore local cursor at the boundary.
@@ -394,6 +401,7 @@ func (r *Router) resolveRegion(ctl inputevent.Ctl) {
 		r.vx, r.vy = clampToServer(r.vx, r.vy, r.serverMons)
 		_ = r.injector.MouseMoveAbs(r.vx, r.vy)
 		r.lastAbsX, r.lastAbsY = r.vx, r.vy
+		_ = r.injector.SetCursorVisible(true)
 
 	case target != nil && r.active != nil && target != r.active:
 		// Crossed between two clients.

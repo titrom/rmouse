@@ -29,6 +29,7 @@ func New() *Display { return &Display{} }
 var (
 	user32                  = windows.NewLazySystemDLL("user32.dll")
 	kernel32                = windows.NewLazySystemDLL("kernel32.dll")
+	gdi32                   = windows.NewLazySystemDLL("gdi32.dll")
 	procEnumDisplayMonitors = user32.NewProc("EnumDisplayMonitors")
 	procGetMonitorInfoW     = user32.NewProc("GetMonitorInfoW")
 	procRegisterClassExW    = user32.NewProc("RegisterClassExW")

@@ -34,6 +34,12 @@ type Injector interface {
 	// (page 7, keyboard). Unknown codes are dropped silently.
 	KeyEvent(hidCode uint16, down bool) error
 
+	// SetCursorVisible hides or restores the OS cursor. The server hides it
+	// while a remote client is grabbed so the trap-parked cursor doesn't sit
+	// visibly in the centre of the screen. Implementations that don't apply
+	// (e.g. clients) may no-op. Safe to call repeatedly with the same value.
+	SetCursorVisible(visible bool) error
+
 	// Close releases any OS resources (virtual device, hooks, cursor clips).
 	// Safe to call multiple times.
 	Close() error

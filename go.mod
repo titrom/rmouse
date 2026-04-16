@@ -3,6 +3,7 @@ module github.com/titrom/rmouse
 go 1.25.3
 
 require (
+	github.com/jezek/xgb v1.3.0
 	github.com/wailsapp/wails/v2 v2.12.0
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/sys v0.43.0

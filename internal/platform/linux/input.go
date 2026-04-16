@@ -3,368 +3,164 @@
 package linux
 
 import (
-	"encoding/binary"
-	"errors"
 	"fmt"
-	"os"
 	"sync"
-	"syscall"
-	"unsafe"
 
-	"golang.org/x/sys/unix"
+	"github.com/jezek/xgb"
+	"github.com/jezek/xgb/xproto"
+	"github.com/jezek/xgb/xtest"
 
 	"github.com/titrom/rmouse/internal/proto"
 )
 
-// Injector implements platform.Injector on Linux via /dev/uinput. It creates
-// a single virtual device that reports relative motion, absolute motion,
-// mouse buttons, wheels, and keyboard keys.
-//
-// Permissions: /dev/uinput must be writable. Typically this means the user
-// is in the "input" group and a udev rule grants 0660 mode on /dev/uinput.
+// Injector implements platform.Injector on Linux via the X11 XTest extension
+// (same backend used by xdotool / x11vnc). Requires an X11 session — Wayland
+// is not supported. No special privileges are needed beyond access to the
+// X display the user is already logged in to.
 type Injector struct {
-	mu sync.Mutex
-	f  *os.File // /dev/uinput
+	mu   sync.Mutex
+	conn *xgb.Conn
+	root xproto.Window
 }
 
-// Absolute range for the virtual pointer. Callers pass pixel coordinates in
-// their own virtual-desktop space; we map that 1:1 into the 0..absRange axis
-// here. absRange is picked large enough to cover realistic multi-monitor
-// desktops without loss of precision.
-const absRange = 32767
-
-// NewInjector opens /dev/uinput, configures a virtual input device, and
-// registers it with the kernel. Call Close to tear it down.
+// NewInjector opens an X connection from $DISPLAY, initialises the XTest
+// extension, and remembers the default screen's root window for absolute
+// motion. Call Close to release the connection.
 func NewInjector() (*Injector, error) {
-	f, err := os.OpenFile("/dev/uinput", os.O_WRONLY|syscall.O_NONBLOCK, 0)
+	conn, err := xgb.NewConn()
 	if err != nil {
-		return nil, fmt.Errorf("open /dev/uinput (is user in 'input' group?): %w", err)
+		return nil, fmt.Errorf("xgb.NewConn (is $DISPLAY set? running under X11?): %w", err)
 	}
-	if err := configureDevice(f.Fd()); err != nil {
-		f.Close()
-		return nil, err
+	if err := xtest.Init(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("XTest init: %w", err)
 	}
-	return &Injector{f: f}, nil
+	screen := xproto.Setup(conn).DefaultScreen(conn)
+	return &Injector{conn: conn, root: screen.Root}, nil
 }
 
-func configureDevice(fd uintptr) error {
-	enables := []struct {
-		req  uintptr
-		code int
-	}{
-		{uiSetEVBit, int(evKey)},
-		{uiSetEVBit, int(evRel)},
-		{uiSetEVBit, int(evAbs)},
-		{uiSetEVBit, int(evSyn)},
-
-		{uiSetRelBit, int(relX)},
-		{uiSetRelBit, int(relY)},
-		{uiSetRelBit, int(relWheel)},
-		{uiSetRelBit, int(relHWheel)},
-
-		{uiSetAbsBit, int(absX)},
-		{uiSetAbsBit, int(absY)},
-
-		{uiSetKeyBit, int(btnLeft)},
-		{uiSetKeyBit, int(btnRight)},
-		{uiSetKeyBit, int(btnMiddle)},
-		{uiSetKeyBit, int(btnSide)},
-		{uiSetKeyBit, int(btnExtra)},
-
-		{uiSetPropBit, inputPropPointer},
-	}
-	// Register every keyboard key we know how to map.
-	for _, code := range knownEvdevKeys() {
-		enables = append(enables, struct {
-			req  uintptr
-			code int
-		}{uiSetKeyBit, code})
-	}
-	for _, e := range enables {
-		if err := ioctlSetInt(fd, e.req, e.code); err != nil {
-			return fmt.Errorf("uinput SET bit 0x%x code %d: %w", e.req, e.code, err)
-		}
-	}
-
-	// UI_DEV_SETUP: name + id + abs-axis range for ABS_X / ABS_Y.
-	var setup uinputSetup
-	setup.ID.BusType = 0x03 // BUS_USB
-	setup.ID.Vendor = 0x1d6b
-	setup.ID.Product = 0x0104
-	setup.ID.Version = 1
-	copy(setup.Name[:], []byte("rmouse virtual input"))
-	if err := ioctlPtr(fd, uiDevSetup, unsafe.Pointer(&setup)); err != nil {
-		return fmt.Errorf("UI_DEV_SETUP: %w", err)
-	}
-
-	// Configure ABS_X/ABS_Y ranges via UI_ABS_SETUP.
-	for _, axis := range []uint16{absX, absY} {
-		var a uinputAbsSetup
-		a.Code = axis
-		a.AbsInfo.Maximum = absRange
-		if err := ioctlPtr(fd, uiAbsSetup, unsafe.Pointer(&a)); err != nil {
-			return fmt.Errorf("UI_ABS_SETUP axis %d: %w", axis, err)
-		}
-	}
-
-	if err := ioctlNone(fd, uiDevCreate); err != nil {
-		return fmt.Errorf("UI_DEV_CREATE: %w", err)
-	}
-	return nil
-}
-
-// write sends one or more input_event records followed by a SYN_REPORT.
-func (i *Injector) write(events ...inputEvent) error {
+// fakeInput is the single funnel for every XTest call. The mutex serialises
+// access to the connection (xgb is concurrency-safe but we want predictable
+// event ordering) and turns a closed connection into a clear error.
+func (i *Injector) fakeInput(typ, detail byte, root xproto.Window, x, y int16) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.f == nil {
-		return errors.New("uinput: device closed")
+	if i.conn == nil {
+		return fmt.Errorf("xtest: connection closed")
 	}
-	buf := make([]byte, 0, 24*(len(events)+1))
-	for _, ev := range events {
-		buf = encodeEvent(buf, ev)
-	}
-	buf = encodeEvent(buf, inputEvent{Type: evSyn, Code: synReport, Value: 0})
-	if _, err := i.f.Write(buf); err != nil {
-		return fmt.Errorf("uinput write: %w", err)
-	}
+	xtest.FakeInput(i.conn, typ, detail, 0, root, x, y, 0)
 	return nil
 }
 
-// MouseMoveRel dispatches REL_X / REL_Y events.
+// MouseMoveRel uses XTest motion with detail=1; root=None per spec.
 func (i *Injector) MouseMoveRel(dx, dy int32) error {
-	var events []inputEvent
-	if dx != 0 {
-		events = append(events, inputEvent{Type: evRel, Code: relX, Value: dx})
-	}
-	if dy != 0 {
-		events = append(events, inputEvent{Type: evRel, Code: relY, Value: dy})
-	}
-	if len(events) == 0 {
-		return nil
-	}
-	return i.write(events...)
+	return i.fakeInput(xproto.MotionNotify, 1, 0, int16(dx), int16(dy))
 }
 
-// MouseMoveAbs dispatches ABS_X / ABS_Y events. (x, y) are pixel coordinates
-// in the local virtual desktop; they are clamped to [0, absRange].
+// MouseMoveAbs uses XTest motion with detail=0 against the default root.
+// (x, y) are screen pixel coords in the X11 root window's coordinate space.
 func (i *Injector) MouseMoveAbs(x, y int32) error {
-	return i.write(
-		inputEvent{Type: evAbs, Code: absX, Value: clampAbs(x)},
-		inputEvent{Type: evAbs, Code: absY, Value: clampAbs(y)},
-	)
+	return i.fakeInput(xproto.MotionNotify, 0, i.root, int16(x), int16(y))
 }
 
-// MouseButton presses or releases a mouse button.
+// MouseButton presses or releases a mouse button. X11 button numbering:
+// 1=left, 2=middle, 3=right, 8=X1 (back), 9=X2 (forward). Buttons 4-7 are
+// reserved for scroll wheels (see MouseWheel).
 func (i *Injector) MouseButton(btn proto.MouseButton, down bool) error {
-	var code uint16
+	var b byte
 	switch btn {
 	case proto.BtnLeft:
-		code = btnLeft
-	case proto.BtnRight:
-		code = btnRight
+		b = 1
 	case proto.BtnMiddle:
-		code = btnMiddle
+		b = 2
+	case proto.BtnRight:
+		b = 3
 	case proto.BtnX1:
-		code = btnSide
+		b = 8
 	case proto.BtnX2:
-		code = btnExtra
+		b = 9
 	default:
 		return fmt.Errorf("unknown button: %d", btn)
 	}
-	val := int32(0)
-	if down {
-		val = 1
+	typ := byte(xproto.ButtonPress)
+	if !down {
+		typ = byte(xproto.ButtonRelease)
 	}
-	return i.write(inputEvent{Type: evKey, Code: code, Value: val})
+	return i.fakeInput(typ, b, 0, 0, 0)
 }
 
-// MouseWheel scrolls by (dx, dy) notches.
+// MouseWheel emits one press+release pair per notch on the appropriate scroll
+// button: 4=up, 5=down, 6=left, 7=right.
 func (i *Injector) MouseWheel(dx, dy int16) error {
-	var events []inputEvent
-	if dy != 0 {
-		events = append(events, inputEvent{Type: evRel, Code: relWheel, Value: int32(dy)})
-	}
-	if dx != 0 {
-		events = append(events, inputEvent{Type: evRel, Code: relHWheel, Value: int32(dx)})
-	}
-	if len(events) == 0 {
+	emit := func(button byte, count int16) error {
+		for n := int16(0); n < count; n++ {
+			if err := i.fakeInput(xproto.ButtonPress, button, 0, 0, 0); err != nil {
+				return err
+			}
+			if err := i.fakeInput(xproto.ButtonRelease, button, 0, 0, 0); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
-	return i.write(events...)
+	switch {
+	case dy > 0:
+		if err := emit(5, dy); err != nil {
+			return err
+		}
+	case dy < 0:
+		if err := emit(4, -dy); err != nil {
+			return err
+		}
+	}
+	switch {
+	case dx > 0:
+		if err := emit(7, dx); err != nil {
+			return err
+		}
+	case dx < 0:
+		if err := emit(6, -dx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// KeyEvent maps HID to evdev and dispatches an EV_KEY event. Unknown codes
-// are dropped silently.
+// KeyEvent maps HID to evdev, then to an X11 keycode. With XKB, X11 keycodes
+// are uniformly evdev_code + 8.
 func (i *Injector) KeyEvent(hidCode uint16, down bool) error {
 	code, ok := hidToEvdev(hidCode)
 	if !ok {
 		return nil
 	}
-	val := int32(0)
-	if down {
-		val = 1
+	keycode := byte(code + 8)
+	typ := byte(xproto.KeyPress)
+	if !down {
+		typ = byte(xproto.KeyRelease)
 	}
-	return i.write(inputEvent{Type: evKey, Code: code, Value: val})
+	return i.fakeInput(typ, keycode, 0, 0, 0)
 }
 
-// Close destroys the virtual device and releases the uinput fd. Safe to
-// call multiple times.
+// SetCursorVisible is a no-op on Linux. The host (Windows) hides its own
+// cursor while grabbed; on the client there is nothing to hide.
+func (*Injector) SetCursorVisible(bool) error { return nil }
+
+// Close releases the X connection. Safe to call multiple times.
 func (i *Injector) Close() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.f == nil {
-		return nil
-	}
-	_ = ioctlNone(i.f.Fd(), uiDevDestroy)
-	err := i.f.Close()
-	i.f = nil
-	return err
-}
-
-// --- Linux kernel types and ioctl plumbing ------------------------------
-
-// ioctl encoding — see Documentation/userspace-api/ioctl/ioctl-decoding.rst.
-const (
-	iocNrbits    = 8
-	iocTypebits  = 8
-	iocNrshift   = 0
-	iocTypeshift = iocNrshift + iocNrbits
-	iocSizeshift = iocTypeshift + iocTypebits
-	iocDirshift  = iocSizeshift + 14
-
-	iocNone  uintptr = 0
-	iocWrite uintptr = 1
-)
-
-func ioc(dir, typ, nr, size uintptr) uintptr {
-	return dir<<iocDirshift | typ<<iocTypeshift | nr<<iocNrshift | size<<iocSizeshift
-}
-func iow(typ, nr, size uintptr) uintptr { return ioc(iocWrite, typ, nr, size) }
-func io_(typ, nr uintptr) uintptr       { return ioc(iocNone, typ, nr, 0) }
-
-const uinputIoctlBase uintptr = 'U'
-
-var (
-	uiDevCreate  = io_(uinputIoctlBase, 1)
-	uiDevDestroy = io_(uinputIoctlBase, 2)
-	uiDevSetup   = iow(uinputIoctlBase, 3, unsafe.Sizeof(uinputSetup{}))
-	uiAbsSetup   = iow(uinputIoctlBase, 4, unsafe.Sizeof(uinputAbsSetup{}))
-	uiSetEVBit   = iow(uinputIoctlBase, 100, 4)
-	uiSetKeyBit  = iow(uinputIoctlBase, 101, 4)
-	uiSetRelBit  = iow(uinputIoctlBase, 102, 4)
-	uiSetAbsBit  = iow(uinputIoctlBase, 103, 4)
-	uiSetPropBit = iow(uinputIoctlBase, 110, 4)
-)
-
-const (
-	evSyn uint16 = 0x00
-	evKey uint16 = 0x01
-	evRel uint16 = 0x02
-	evAbs uint16 = 0x03
-
-	synReport uint16 = 0
-
-	relX      uint16 = 0x00
-	relY      uint16 = 0x01
-	relHWheel uint16 = 0x06
-	relWheel  uint16 = 0x08
-
-	absX uint16 = 0x00
-	absY uint16 = 0x01
-
-	btnLeft   uint16 = 0x110
-	btnRight  uint16 = 0x111
-	btnMiddle uint16 = 0x112
-	btnSide   uint16 = 0x113
-	btnExtra  uint16 = 0x114
-
-	inputPropPointer = 0x00
-)
-
-type inputID struct {
-	BusType uint16
-	Vendor  uint16
-	Product uint16
-	Version uint16
-}
-
-type uinputSetup struct {
-	ID           inputID
-	Name         [80]byte
-	FFEffectsMax uint32
-}
-
-type absInfo struct {
-	Value      int32
-	Minimum    int32
-	Maximum    int32
-	Fuzz       int32
-	Flat       int32
-	Resolution int32
-}
-
-type uinputAbsSetup struct {
-	Code    uint16
-	_       [2]byte
-	AbsInfo absInfo
-}
-
-type inputEvent struct {
-	Sec, Usec int64 // timeval; zero means "kernel fills in"
-	Type      uint16
-	Code      uint16
-	Value     int32
-}
-
-// encodeEvent writes a 24-byte input_event record (x86_64 layout).
-func encodeEvent(buf []byte, ev inputEvent) []byte {
-	var tmp [24]byte
-	binary.LittleEndian.PutUint64(tmp[0:], uint64(ev.Sec))
-	binary.LittleEndian.PutUint64(tmp[8:], uint64(ev.Usec))
-	binary.LittleEndian.PutUint16(tmp[16:], ev.Type)
-	binary.LittleEndian.PutUint16(tmp[18:], ev.Code)
-	binary.LittleEndian.PutUint32(tmp[20:], uint32(ev.Value))
-	return append(buf, tmp[:]...)
-}
-
-func ioctlSetInt(fd, req uintptr, val int) error {
-	v := int32(val)
-	_, _, e := syscall.Syscall(unix.SYS_IOCTL, fd, req, uintptr(unsafe.Pointer(&v)))
-	if e != 0 {
-		return e
+	if i.conn != nil {
+		i.conn.Close()
+		i.conn = nil
 	}
 	return nil
-}
-func ioctlPtr(fd, req uintptr, p unsafe.Pointer) error {
-	_, _, e := syscall.Syscall(unix.SYS_IOCTL, fd, req, uintptr(p))
-	if e != 0 {
-		return e
-	}
-	return nil
-}
-func ioctlNone(fd, req uintptr) error {
-	_, _, e := syscall.Syscall(unix.SYS_IOCTL, fd, req, 0)
-	if e != 0 {
-		return e
-	}
-	return nil
-}
-
-func clampAbs(v int32) int32 {
-	if v < 0 {
-		return 0
-	}
-	if v > absRange {
-		return absRange
-	}
-	return v
 }
 
 // --- HID → evdev keymap ------------------------------------------------
 
 // hidToEvdev maps USB HID keyboard usage codes (page 7) to Linux evdev
-// KEY_* codes. Unknown codes return ok=false.
+// KEY_* codes. The X11 keycode is then evdev + 8 (XKB convention).
+// Unknown HID codes return ok=false.
 func hidToEvdev(hid uint16) (code uint16, ok bool) {
 	if v, found := hidKeymap[hid]; found {
 		return v, true
@@ -372,64 +168,53 @@ func hidToEvdev(hid uint16) (code uint16, ok bool) {
 	return 0, false
 }
 
-// knownEvdevKeys returns every evdev code in hidKeymap, for UI_SET_KEYBIT.
-func knownEvdevKeys() []int {
-	out := make([]int, 0, len(hidKeymap))
-	for _, v := range hidKeymap {
-		out = append(out, int(v))
-	}
-	return out
-}
-
 // evdev codes (linux/input-event-codes.h). Kept local so we don't pull in
 // a bigger dependency just for these constants.
 const (
-	keyEsc       = 1
-	keyMinus     = 12
-	keyEqual     = 13
-	keyBackspace = 14
-	keyTab       = 15
-	keyLeftbrace = 26
+	keyEsc        = 1
+	keyMinus      = 12
+	keyEqual      = 13
+	keyBackspace  = 14
+	keyTab        = 15
+	keyLeftbrace  = 26
 	keyRightbrace = 27
-	keyEnter     = 28
-	keyLeftctrl  = 29
-	keySemicolon = 39
+	keyEnter      = 28
+	keyLeftctrl   = 29
+	keySemicolon  = 39
 	keyApostrophe = 40
-	keyGrave     = 41
-	keyLeftshift = 42
-	keyBackslash = 43
-	keyComma     = 51
-	keyDot       = 52
-	keySlash     = 53
+	keyGrave      = 41
+	keyLeftshift  = 42
+	keyBackslash  = 43
+	keyComma      = 51
+	keyDot        = 52
+	keySlash      = 53
 	keyRightshift = 54
-	keyLeftalt   = 56
-	keySpace     = 57
-	keyCapslock  = 58
-	keyF1        = 59
-	keyF11       = 87
-	keyF12       = 88
-	keyRightctrl = 97
-	keyRightalt  = 100
-	keyHome      = 102
-	keyUp        = 103
-	keyPageup    = 104
-	keyLeft      = 105
-	keyRight     = 106
-	keyEnd       = 107
-	keyDown      = 108
-	keyPagedown  = 109
-	keyInsert    = 110
-	keyDelete    = 111
-	keyLeftmeta  = 125
-	keyRightmeta = 126
+	keyLeftalt    = 56
+	keySpace      = 57
+	keyCapslock   = 58
+	keyF1         = 59
+	keyF11        = 87
+	keyF12        = 88
+	keyRightctrl  = 97
+	keyRightalt   = 100
+	keyHome       = 102
+	keyUp         = 103
+	keyPageup     = 104
+	keyLeft       = 105
+	keyRight      = 106
+	keyEnd        = 107
+	keyDown       = 108
+	keyPagedown   = 109
+	keyInsert     = 110
+	keyDelete     = 111
+	keyLeftmeta   = 125
+	keyRightmeta  = 126
 )
 
 var hidKeymap = func() map[uint16]uint16 {
 	m := make(map[uint16]uint16, 128)
-	// a..z → KEY_A (30) + offsets derived from QWERTY layout
-	// HID a..z is sequential but evdev row order is different.
+	// HID a..z → evdev KEY_* (QWERTY row order, not alphabetical).
 	qwerty := map[uint16]uint16{
-		// HID → evdev
 		0x04: 30, 0x05: 48, 0x06: 46, 0x07: 32, 0x08: 18, 0x09: 33, // a b c d e f
 		0x0a: 34, 0x0b: 35, 0x0c: 23, 0x0d: 36, 0x0e: 37, 0x0f: 38, // g h i j k l
 		0x10: 50, 0x11: 49, 0x12: 24, 0x13: 25, 0x14: 16, 0x15: 19, // m n o p q r

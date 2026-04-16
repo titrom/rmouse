@@ -4,21 +4,33 @@ package windows
 
 import (
 	"fmt"
+	"sync"
 	"unsafe"
 
 	"github.com/titrom/rmouse/internal/proto"
 )
 
 // Injector implements platform.Injector on Windows via SendInput.
-type Injector struct{}
+type Injector struct {
+	cursorMu     sync.Mutex
+	cursorHidden bool
+}
 
 // NewInjector returns a Windows SendInput-based input injector. The Windows
-// injector has no resources to release; Close is a no-op.
+// injector has no resources to release; Close restores the system cursor in
+// case it was hidden by a still-active grab.
 func NewInjector() (*Injector, error) { return &Injector{}, nil }
 
 var (
-	procSendInput    = user32.NewProc("SendInput")
-	procSetCursorPos = user32.NewProc("SetCursorPos")
+	procSendInput              = user32.NewProc("SendInput")
+	procSetCursorPos           = user32.NewProc("SetCursorPos")
+	procSetSystemCursor        = user32.NewProc("SetSystemCursor")
+	procCreateIconIndirect     = user32.NewProc("CreateIconIndirect")
+	procDestroyIcon            = user32.NewProc("DestroyIcon")
+	procCopyIcon               = user32.NewProc("CopyIcon")
+	procSystemParametersInfoW  = user32.NewProc("SystemParametersInfoW")
+	procCreateBitmap           = gdi32.NewProc("CreateBitmap")
+	procDeleteObject           = gdi32.NewProc("DeleteObject")
 )
 
 // Win32 INPUT struct constants.
@@ -196,8 +208,113 @@ func (*Injector) KeyEvent(hidCode uint16, down bool) error {
 	return sendInput([]inputRecord{keyRecord(vk, flags)})
 }
 
-// Close is a no-op on Windows — no persistent OS resources are held.
-func (*Injector) Close() error { return nil }
+// Close restores the system cursor in case a grab was active when the server
+// shut down, then releases. Safe to call multiple times.
+func (i *Injector) Close() error {
+	_ = i.SetCursorVisible(true)
+	return nil
+}
+
+// Win32 cursor IDs used by SetSystemCursor / SystemParametersInfo.
+const (
+	ocrNormal      uint32 = 32512
+	ocrIBeam       uint32 = 32513
+	ocrWait        uint32 = 32514
+	ocrCross       uint32 = 32515
+	ocrUp          uint32 = 32516
+	ocrSizeNWSE    uint32 = 32642
+	ocrSizeNESW    uint32 = 32643
+	ocrSizeWE      uint32 = 32644
+	ocrSizeNS      uint32 = 32645
+	ocrSizeAll     uint32 = 32646
+	ocrNo          uint32 = 32648
+	ocrHand        uint32 = 32649
+	ocrAppStarting uint32 = 32650
+
+	spiSetCursors uint32 = 0x0057
+)
+
+var systemCursorIDs = []uint32{
+	ocrNormal, ocrIBeam, ocrWait, ocrCross, ocrUp,
+	ocrSizeNWSE, ocrSizeNESW, ocrSizeWE, ocrSizeNS, ocrSizeAll,
+	ocrNo, ocrHand, ocrAppStarting,
+}
+
+type iconInfo struct {
+	FIcon    int32
+	XHotspot uint32
+	YHotspot uint32
+	HbmMask  uintptr
+	HbmColor uintptr
+}
+
+// SetCursorVisible toggles the global system cursor by replacing every standard
+// cursor with a fully-transparent icon while hidden, and restoring the user's
+// cursor scheme via SystemParametersInfo on show. Idempotent.
+func (i *Injector) SetCursorVisible(visible bool) error {
+	i.cursorMu.Lock()
+	defer i.cursorMu.Unlock()
+	if visible == !i.cursorHidden {
+		return nil
+	}
+	if visible {
+		// Restore the user's full cursor scheme.
+		ret, _, errno := procSystemParametersInfoW.Call(uintptr(spiSetCursors), 0, 0, 0)
+		if ret == 0 {
+			return fmt.Errorf("SystemParametersInfo(SPI_SETCURSORS): %w", errno)
+		}
+		i.cursorHidden = false
+		return nil
+	}
+	blank, err := createBlankCursor()
+	if err != nil {
+		return err
+	}
+	defer procDestroyIcon.Call(blank)
+	// SetSystemCursor takes ownership of each handle it receives, so duplicate
+	// the blank cursor for every slot we replace.
+	for _, id := range systemCursorIDs {
+		dup, _, _ := procCopyIcon.Call(blank)
+		if dup == 0 {
+			continue
+		}
+		ret, _, _ := procSetSystemCursor.Call(dup, uintptr(id))
+		if ret == 0 {
+			procDestroyIcon.Call(dup)
+		}
+	}
+	i.cursorHidden = true
+	return nil
+}
+
+// createBlankCursor builds a 1x1 fully-transparent monochrome cursor. AND mask
+// bit set + XOR mask bit clear = transparent pixel; the GDI bitmaps are owned
+// by the returned icon and freed by DestroyIcon.
+func createBlankCursor() (uintptr, error) {
+	andBits := [1]byte{0xFF}
+	xorBits := [1]byte{0x00}
+	hbmMask, _, errno := procCreateBitmap.Call(1, 1, 1, 1, uintptr(unsafe.Pointer(&andBits[0])))
+	if hbmMask == 0 {
+		return 0, fmt.Errorf("CreateBitmap(mask): %w", errno)
+	}
+	hbmColor, _, errno := procCreateBitmap.Call(1, 1, 1, 1, uintptr(unsafe.Pointer(&xorBits[0])))
+	if hbmColor == 0 {
+		procDeleteObject.Call(hbmMask)
+		return 0, fmt.Errorf("CreateBitmap(color): %w", errno)
+	}
+	info := iconInfo{
+		FIcon:    0, // cursor
+		HbmMask:  hbmMask,
+		HbmColor: hbmColor,
+	}
+	icon, _, errno := procCreateIconIndirect.Call(uintptr(unsafe.Pointer(&info)))
+	procDeleteObject.Call(hbmMask)
+	procDeleteObject.Call(hbmColor)
+	if icon == 0 {
+		return 0, fmt.Errorf("CreateIconIndirect: %w", errno)
+	}
+	return icon, nil
+}
 
 // hidToVK maps a USB HID keyboard usage (page 7) to a Windows virtual-key
 // code. The second return signals whether the key needs the Extended flag
