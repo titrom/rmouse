@@ -80,6 +80,12 @@ html, body {
 .panel-connection {
   width: 400px;
   flex: 0 0 400px;
+  overflow-y: auto;
+}
+.panel-connection::-webkit-scrollbar { width: 8px; }
+.panel-connection::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.18);
+  border-radius: 4px;
 }
 
 .panel-advanced {

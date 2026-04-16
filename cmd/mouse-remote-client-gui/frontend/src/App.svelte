@@ -256,6 +256,18 @@
         <p class="detail">retry in {(retryMs / 1000).toFixed(1)}s</p>
       {/if}
 
+      {#if !hasInputPerm}
+        <div class="warn-box">
+          <p>Input permission required to inject mouse/keyboard events.</p>
+          <button class="btn primary" on:click={grantInputPerm} disabled={permBusy}>
+            {permBusy ? "Requesting…" : "Grant access"}
+          </button>
+          {#if permError}
+            <p class="error" style="margin-top:8px;">{permError}</p>
+          {/if}
+        </div>
+      {/if}
+
       <div class="field">
         <label for="addr">Server</label>
         <input id="addr" type="text" bind:value={addr} placeholder="host:port" disabled={running} />
@@ -275,18 +287,6 @@
               aria-expanded={advancedOpen}>
         {advancedOpen ? "▾" : "▸"} Advanced
       </button>
-
-      {#if !hasInputPerm}
-        <div class="warn-box">
-          <p>Input permission required to inject mouse/keyboard events.</p>
-          <button class="btn primary" on:click={grantInputPerm} disabled={permBusy}>
-            {permBusy ? "Requesting…" : "Grant access"}
-          </button>
-          {#if permError}
-            <p class="error" style="margin-top:8px;">{permError}</p>
-          {/if}
-        </div>
-      {/if}
 
       {#if error || lastErr}
         <p class="error">{error || lastErr}</p>
