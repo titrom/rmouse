@@ -4,6 +4,10 @@ import {main} from '../models';
 
 export function EnumerateMonitors():Promise<Array<main.MonitorDTO>>;
 
+export function HasInputPermission():Promise<boolean>;
+
+export function RequestInputPermission():Promise<void>;
+
 export function IsRunning():Promise<boolean>;
 
 export function LoadConfig():Promise<main.ConfigDTO>;

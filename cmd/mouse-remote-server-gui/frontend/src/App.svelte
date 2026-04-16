@@ -341,9 +341,19 @@
   }
   // When the server's own monitor layout changes, every live client's
   // offset (which is anchored to serverMin/serverW/serverH) becomes stale.
-  // Recompute from the stored (col, row).
-  $: if (monitors.length > 0 && liveClients.length > 0) {
-    for (const c of liveClients) liveOffsetFromCell(c);
+  // Recompute from the stored (col, row). NOTE: depend ONLY on `monitors`,
+  // not `liveClients` — otherwise a drag-induced bump would re-trigger
+  // this and snap the offset back to the cell on every mousemove.
+  let lastMonsKey = "";
+  $: {
+    const key = monitors.map(m => `${m.id}:${m.x},${m.y},${m.w},${m.h}`).join("|");
+    if (key !== lastMonsKey) {
+      lastMonsKey = key;
+      if (monitors.length > 0) {
+        for (const c of liveClients) liveOffsetFromCell(c);
+        bumpClients();
+      }
+    }
   }
   const maxZoom = 5;
   // Minimum on-screen size a monitor rectangle must keep so its label

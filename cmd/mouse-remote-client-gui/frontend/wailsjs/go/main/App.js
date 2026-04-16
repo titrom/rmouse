@@ -6,6 +6,14 @@ export function EnumerateMonitors() {
   return window['go']['main']['App']['EnumerateMonitors']();
 }
 
+export function HasInputPermission() {
+  return window['go']['main']['App']['HasInputPermission']();
+}
+
+export function RequestInputPermission() {
+  return window['go']['main']['App']['RequestInputPermission']();
+}
+
 export function IsRunning() {
   return window['go']['main']['App']['IsRunning']();
 }

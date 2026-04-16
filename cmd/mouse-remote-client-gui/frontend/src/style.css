@@ -251,6 +251,24 @@ html, body {
   word-break: break-word;
 }
 
+/* --- inline warning with action ------------------------------------- */
+
+.warn-box {
+  padding: 10px 12px;
+  background: rgba(176, 138, 62, 0.10);
+  border: 1px solid rgba(176, 138, 62, 0.25);
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.warn-box p {
+  margin: 0;
+  font-size: 12px;
+  color: #6e5a2a;
+}
+.warn-box .btn { align-self: flex-start; }
+
 /* --- error ------------------------------------------------------------ */
 
 .error {

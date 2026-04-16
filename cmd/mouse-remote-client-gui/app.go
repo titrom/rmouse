@@ -235,6 +235,27 @@ func (a *App) IsRunning() bool {
 	return a.cancel != nil
 }
 
+// HasInputPermission reports whether /dev/uinput is writable by the
+// current process. On non-Linux platforms it always returns true since
+// no equivalent permission step is required.
+func (a *App) HasInputPermission() bool {
+	return hasUinputAccess()
+}
+
+// RequestInputPermission attempts to grant the current user write access
+// to /dev/uinput on Linux by:
+//   1. Installing a persistent udev rule (input group, mode 0660).
+//   2. Adding the current user to the `input` group (effective next login).
+//   3. Loading the uinput kernel module.
+//   4. Doing a one-shot chmod 0666 so the running process can use uinput
+//      *before* the next login.
+// All four steps run inside a single pkexec invocation, which presents
+// a GUI password prompt via PolicyKit. On non-Linux platforms it's a
+// no-op that returns nil.
+func (a *App) RequestInputPermission() error {
+	return requestUinputAccess()
+}
+
 func (a *App) emitEvent(ev client.Event) {
 	switch e := ev.(type) {
 	case client.StatusEvent:

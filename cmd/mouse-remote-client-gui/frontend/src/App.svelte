@@ -3,6 +3,7 @@
   import { slide } from "svelte/transition";
   import {
     EnumerateMonitors, IsRunning, LoadConfig, SaveConfig, Start, Stop,
+    HasInputPermission, RequestInputPermission,
   } from "../wailsjs/go/main/App";
   import { EventsOn, EventsOff } from "../wailsjs/runtime/runtime";
   import { main } from "../wailsjs/go/models";
@@ -28,6 +29,9 @@
   let grabbing = false;
   let error = "";
   let advancedOpen = false;
+  let hasInputPerm = true;       // optimistic; confirmed on mount
+  let permBusy = false;
+  let permError = "";
 
   // --- logs ---------------------------------------------------------------
   type LogEntry = { ts: string; level: "info" | "warn" | "error"; msg: string };
@@ -98,6 +102,26 @@
     running = await IsRunning();
     state = running ? "connecting" : "idle";
     try { monitors = await EnumerateMonitors(); } catch { monitors = []; }
+    try { hasInputPerm = await HasInputPermission(); } catch { hasInputPerm = true; }
+  }
+
+  // Trigger the OS password prompt (pkexec on Linux) and reflect the
+  // outcome. On success, recheck the flag — Linux may still need a
+  // logout/login if the udev rule path is the only one that landed.
+  async function grantInputPerm() {
+    if (permBusy) return;
+    permBusy = true;
+    permError = "";
+    try {
+      await RequestInputPermission();
+      hasInputPerm = await HasInputPermission();
+      log("info", hasInputPerm ? "input permission granted" : "permission set, log out and back in to apply");
+    } catch (e: any) {
+      permError = String(e?.message ?? e);
+      log("error", `grant input failed: ${permError}`);
+    } finally {
+      permBusy = false;
+    }
   }
 
   async function connect() {
@@ -162,7 +186,12 @@
     lastPongAt = now;
   }
   function onHotplugUnavailable(p: any) { log("warn", `hotplug unavailable: ${p?.err ?? ""}`); }
-  function onInjectorUnavailable(p: any) { log("warn", `injector unavailable: ${p?.err ?? ""}`); }
+  function onInjectorUnavailable(p: any) {
+    log("warn", `injector unavailable: ${p?.err ?? ""}`);
+    // Surface the grant button — most common cause on Linux is the
+    // permission gate we know how to fix.
+    hasInputPerm = false;
+  }
   function onGrab(p: any) { grabbing = !!p?.on; log("info", `grab ${p?.on ? "on" : "off"}`); }
   function onStopped() {
     running = false;
@@ -246,6 +275,18 @@
               aria-expanded={advancedOpen}>
         {advancedOpen ? "▾" : "▸"} Advanced
       </button>
+
+      {#if !hasInputPerm}
+        <div class="warn-box">
+          <p>Input permission required to inject mouse/keyboard events.</p>
+          <button class="btn primary" on:click={grantInputPerm} disabled={permBusy}>
+            {permBusy ? "Requesting…" : "Grant access"}
+          </button>
+          {#if permError}
+            <p class="error" style="margin-top:8px;">{permError}</p>
+          {/if}
+        </div>
+      {/if}
 
       {#if error || lastErr}
         <p class="error">{error || lastErr}</p>
