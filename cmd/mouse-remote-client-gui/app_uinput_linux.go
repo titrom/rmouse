@@ -48,28 +48,48 @@ func requestUinputAccess() error {
 	//     mode back to 0660 root:input, leaving us locked out again.
 	//   - chown the live device to the calling user so this very process
 	//     can rw it before logging out.
-	// NOTE: the udev rule deliberately omits OPTIONS+="static_node=uinput".
-	// On some distros (we've seen this on user-reported Linux Mint / Ubuntu
-	// builds) the static node is created *before* the kernel module loads,
-	// and opening it returns a fd that succeeds at open() but rejects
-	// UI_SET_EVBIT with EINVAL. Forcing modprobe + chown gives a real fd.
+	// What this snippet does, in order:
+	//   1. Persistent udev rule (without static_node — that one bites us:
+	//      the prebuilt node opens fine but every ioctl returns EINVAL).
+	//   2. usermod for future logins.
+	//   3. modprobe uinput. Does nothing if it's compiled into the kernel.
+	//   4. Read the real (major:minor) from /sys/devices/virtual/misc/uinput/dev,
+	//      then `rm -f /dev/uinput && mknod ... c MAJOR MINOR`. This wipes
+	//      any stale static-node from a previous rule and re-binds /dev/uinput
+	//      to the live driver.
+	//   5. chown to the calling user + chmod 0600 for immediate access.
 	script := fmt.Sprintf(`set -e
+USERNAME=%s
 mkdir -p /etc/udev/rules.d
 cat > /etc/udev/rules.d/99-uinput.rules <<'EOF'
 KERNEL=="uinput", GROUP="input", MODE="0660"
 EOF
 udevadm control --reload-rules || true
-usermod -aG input %s || true
-# Force a clean reload so any stale static node is replaced by the real
-# device the kernel module exposes.
-modprobe -r uinput >/dev/null 2>&1 || true
-modprobe uinput || true
-udevadm settle || true
-if [ -e /dev/uinput ]; then
-  chown %s /dev/uinput || true
+usermod -aG input "$USERNAME" || true
+modprobe uinput >/dev/null 2>&1 || true
+# Wait briefly for the misc device to appear.
+for i in 1 2 3 4 5; do
+  [ -r /sys/devices/virtual/misc/uinput/dev ] && break
+  sleep 0.2
+done
+if [ -r /sys/devices/virtual/misc/uinput/dev ]; then
+  MM=$(cat /sys/devices/virtual/misc/uinput/dev)
+  MAJOR=${MM%%:*}
+  MINOR=${MM##*:}
+  rm -f /dev/uinput
+  mknod /dev/uinput c "$MAJOR" "$MINOR"
+  chown "$USERNAME" /dev/uinput
+  chmod 0600 /dev/uinput
+else
+  # Fallback if /sys path not available — try the canonical pair and
+  # fix up perms if a node already exists.
+  if [ ! -e /dev/uinput ]; then
+    mknod /dev/uinput c 10 223 || true
+  fi
+  chown "$USERNAME" /dev/uinput || true
   chmod 0600 /dev/uinput || true
 fi
-`, shellQuote(username), shellQuote(username))
+`, shellQuote(username))
 
 	cmd := exec.Command("pkexec", "sh", "-c", script)
 	out, err := cmd.CombinedOutput()
