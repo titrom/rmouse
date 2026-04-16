@@ -565,11 +565,13 @@ func (r *Router) clientAt(x, y int32) *routerClient {
 // grabHysteresis is the pixel buffer applied on grab transitions. On cross-in
 // the virtual cursor is pushed this far past the boundary so subsequent
 // motion doesn't immediately exit; on release it is parked this far inside
-// server bounds for the symmetric reason. Sized to absorb a single hook
-// event's worth of motion at typical high-DPI gaming mice (~1600–3200
-// counts/in produce 30–80px per event during normal pointing); below this
-// the cursor oscillates at the boundary on every flick.
-const grabHysteresis int32 = 100
+// server bounds for the symmetric reason. Bumped to 500 — a fast flick at
+// 3200 DPI / 1000 Hz can push hundreds of pixels in a single hook event,
+// and 100 was visibly insufficient (corner-twitch on irregular layouts).
+// Upper bound is set by the smallest expected client/server monitor side:
+// 500 leaves ≥700 px of headroom inside any 1200-tall client (e.g. eDP-1
+// 1920×1200), so the projected vy is safely interior.
+const grabHysteresis int32 = 500
 
 // padInsideServer pulls (x, y) at least grabHysteresis pixels away from any
 // server bbox edge it sits at. Used after releasing grab so the next at-edge
