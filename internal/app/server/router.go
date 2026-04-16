@@ -355,19 +355,26 @@ func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
 		pushLeft := absX <= r.serverMinX && r.haveLastAbs && r.lastAbsX <= r.serverMinX
 		pushBot := absY >= r.serverMaxY-1 && r.haveLastAbs && r.lastAbsY >= r.serverMaxY-1
 		pushTop := absY <= r.serverMinY && r.haveLastAbs && r.lastAbsY <= r.serverMinY
+		// On grab-in we project the virtual cursor grabHysteresis pixels
+		// *past* the boundary, not exactly at it. A wireless mouse jitters
+		// ±1–2px between hook samples; landing exactly on the boundary
+		// meant the next noisy sample would shove vx back into server,
+		// triggering an immediate release, then re-cross, then release —
+		// the visible "twitch in the corner" the user reported. Putting
+		// vx well inside the client's rect absorbs that jitter.
 		var crossed bool
 		switch {
 		case pushRight:
-			r.vx, r.vy = r.serverMaxX, absY
+			r.vx, r.vy = r.serverMaxX+grabHysteresis, absY
 			crossed = true
 		case pushLeft:
-			r.vx, r.vy = r.serverMinX-1, absY
+			r.vx, r.vy = r.serverMinX-1-grabHysteresis, absY
 			crossed = true
 		case pushBot:
-			r.vx, r.vy = absX, r.serverMaxY
+			r.vx, r.vy = absX, r.serverMaxY+grabHysteresis
 			crossed = true
 		case pushTop:
-			r.vx, r.vy = absX, r.serverMinY-1
+			r.vx, r.vy = absX, r.serverMinY-1-grabHysteresis
 			crossed = true
 		}
 		if !crossed {
@@ -426,6 +433,12 @@ func (r *Router) resolveRegion(ctl inputevent.Ctl) {
 		ctl.SetConsume(false)
 		// Clamp virtual cursor to server bounds so next grab re-enters cleanly.
 		r.vx, r.vy = clampToServer(r.vx, r.vy, r.serverMons)
+		// Hysteresis on release: park the cursor grabHysteresis pixels away
+		// from any boundary it might have just exited through. Without this
+		// vx lands flush against e.g. serverMaxX-1, lastAbs is flush, and the
+		// very next at-edge hook event re-triggers pushRight — wireless-mouse
+		// jitter at the corner would oscillate forever.
+		r.vx, r.vy = padInsideServer(r.vx, r.vy, r.serverMinX, r.serverMaxX, r.serverMinY, r.serverMaxY)
 		_ = r.injector.MouseMoveAbs(r.vx, r.vy)
 		r.lastAbsX, r.lastAbsY = r.vx, r.vy
 		_ = r.injector.SetCursorVisible(true)
@@ -470,6 +483,32 @@ func (r *Router) clientAt(x, y int32) *routerClient {
 		}
 	}
 	return nil
+}
+
+// grabHysteresis is the pixel buffer applied on grab transitions. On cross-in
+// the virtual cursor is pushed this far past the boundary so subsequent
+// jitter doesn't immediately exit; on release it is parked this far inside
+// server bounds for the symmetric reason. 16 covers wireless-mouse noise
+// while staying invisible at typical pointer speeds.
+const grabHysteresis int32 = 16
+
+// padInsideServer pulls (x, y) at least grabHysteresis pixels away from any
+// server bbox edge it sits at. Used after releasing grab so the next at-edge
+// hook event has to actually be pushed there, not just inherit from release.
+func padInsideServer(x, y, minX, maxX, minY, maxY int32) (int32, int32) {
+	if x >= maxX-1-grabHysteresis {
+		x = maxX - 1 - grabHysteresis
+	}
+	if x <= minX+grabHysteresis {
+		x = minX + grabHysteresis
+	}
+	if y >= maxY-1-grabHysteresis {
+		y = maxY - 1 - grabHysteresis
+	}
+	if y <= minY+grabHysteresis {
+		y = minY + grabHysteresis
+	}
+	return x, y
 }
 
 func clampToServer(x, y int32, mons []proto.Monitor) (int32, int32) {
