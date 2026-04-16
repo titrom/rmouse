@@ -18,10 +18,19 @@ import (
 // is not supported. No special privileges are needed beyond access to the
 // X display the user is already logged in to.
 type Injector struct {
-	mu   sync.Mutex
-	conn *xgb.Conn
-	root xproto.Window
+	mu       sync.Mutex
+	conn     *xgb.Conn
+	root     xproto.Window
+	unsynced int
 }
+
+// xgb keeps an internal cookieChan of size 1000; once full it forces its own
+// synchronous roundtrip to the X server, which shows up as a periodic mouse
+// hiccup when streaming positions at high rate. We pre-empt that by syncing
+// every syncEvery unchecked requests. Each Sync is a sub-millisecond local
+// X roundtrip, so amortised it spreads what would have been a single ~1ms
+// stall across many invisible nudges.
+const syncEvery = 32
 
 // NewInjector opens an X connection from $DISPLAY, initialises the XTest
 // extension, and remembers the default screen's root window for absolute
@@ -49,6 +58,11 @@ func (i *Injector) fakeInput(typ, detail byte, root xproto.Window, x, y int16) e
 		return fmt.Errorf("xtest: connection closed")
 	}
 	xtest.FakeInput(i.conn, typ, detail, 0, root, x, y, 0)
+	i.unsynced++
+	if i.unsynced >= syncEvery {
+		i.conn.Sync()
+		i.unsynced = 0
+	}
 	return nil
 }
 

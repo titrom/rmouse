@@ -24,7 +24,27 @@ type Session struct {
 	mu   sync.Mutex
 }
 
-func newSession(c net.Conn) *Session { return &Session{conn: c} }
+func newSession(c net.Conn) *Session {
+	// Nagle batches small writes into bursts every ~40ms — fine for bulk
+	// streams but visible as jitter when our 1-byte-frame mouse positions
+	// arrive at the client all at once. Disable it on the underlying TCP
+	// socket. tls.Conn (and any other wrapper exposing NetConn()) is unwrapped
+	// until we hit a real *net.TCPConn, then SetNoDelay is best-effort.
+	type netConner interface{ NetConn() net.Conn }
+	cur := c
+	for cur != nil {
+		if tcp, ok := cur.(*net.TCPConn); ok {
+			_ = tcp.SetNoDelay(true)
+			break
+		}
+		w, ok := cur.(netConner)
+		if !ok {
+			break
+		}
+		cur = w.NetConn()
+	}
+	return &Session{conn: c}
+}
 
 // Send writes one framed message.
 func (s *Session) Send(m proto.Message) error {

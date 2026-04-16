@@ -328,9 +328,9 @@ func (r *Router) handleEvent(ev inputevent.Event, ctl inputevent.Ctl) {
 // onMouseMove processes one absolute-position mouse event from capture.
 //
 // When not grabbed, the virtual cursor tracks the physical cursor
-// directly. If the physical cursor is sitting at the rightmost edge of the
-// server's desktop AND the OS reports the same position as the previous
-// event, we infer the user is pushing the mouse further right — Windows
+// directly. If the physical cursor is sitting at any edge of the server's
+// desktop AND the OS reports the same position as the previous event, we
+// infer the user is pushing the mouse further in that direction — Windows
 // can't move the cursor past the edge, but the hook still fires for
 // hardware motion. That's our cue to enter grab mode.
 //
@@ -349,17 +349,36 @@ func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
 			return
 		}
 		// Cursor didn't move but a hardware event fired — pushing at a wall.
-		if absX >= r.serverMaxX-1 {
-			// Right edge: try to cross into a client placed to the right.
-			r.vx = r.serverMaxX
-			r.vy = absY
-			r.resolveRegion(ctl)
-			if r.active != nil {
-				// Grab succeeded — trap the physical cursor at centre so we
-				// keep getting non-zero deltas.
-				_ = r.injector.MouseMoveAbs(r.trapX, r.trapY)
-				r.lastAbsX, r.lastAbsY = r.trapX, r.trapY
-			}
+		// Pick which edge is being pushed and project the virtual cursor
+		// just past it so resolveRegion can find a client placed in that
+		// direction. Right/bottom edges are inclusive of MaxX/MaxY (where
+		// a flush-right/flush-below client's left/top sits); left/top edges
+		// need a -1 step to land *inside* a client whose right/bottom is
+		// at serverMinX/Y (exclusive in the clientAt rect test).
+		var crossed bool
+		switch {
+		case absX >= r.serverMaxX-1:
+			r.vx, r.vy = r.serverMaxX, absY
+			crossed = true
+		case absX <= r.serverMinX:
+			r.vx, r.vy = r.serverMinX-1, absY
+			crossed = true
+		case absY >= r.serverMaxY-1:
+			r.vx, r.vy = absX, r.serverMaxY
+			crossed = true
+		case absY <= r.serverMinY:
+			r.vx, r.vy = absX, r.serverMinY-1
+			crossed = true
+		}
+		if !crossed {
+			return
+		}
+		r.resolveRegion(ctl)
+		if r.active != nil {
+			// Grab succeeded — trap the physical cursor at centre so we
+			// keep getting non-zero deltas.
+			_ = r.injector.MouseMoveAbs(r.trapX, r.trapY)
+			r.lastAbsX, r.lastAbsY = r.trapX, r.trapY
 		}
 		return
 	}

@@ -77,16 +77,23 @@ html, body {
   display: flex;
   gap: 16px;
   flex: 0 0 400px;
+  /* Without min-height:0 the row's auto-min-content size lets a tall log
+   * list push the row past 400px, defeating the fixed flex-basis. */
+  min-height: 0;
 }
 
 .panel-listener {
   width: 400px;
   flex: 0 0 400px;
+  min-height: 0;
 }
 
 .panel-logs {
   flex: 1;
   min-width: 0;
+  /* Same reason as row-top — pin the panel so .log-box has a definite
+   * parent height to scroll inside. */
+  min-height: 0;
 }
 
 .panel-screen {

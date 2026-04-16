@@ -387,6 +387,12 @@
     queueMicrotask(() => { if (logBox) logBox.scrollTop = logBox.scrollHeight; });
   }
   function clearLogs() { logs = []; }
+  function spamTestLogs() {
+    const levels: LogEntry["level"][] = ["info", "warn", "error"];
+    for (let i = 0; i < 50; i++) {
+      log(levels[i % 3], `test entry #${logs.length + 1} — lorem ipsum dolor sit amet`);
+    }
+  }
 
   async function refresh() {
     const cfg = await LoadConfig();
@@ -599,7 +605,11 @@
   <section class="panel panel-logs">
     <header class="panel-head">
       <h2>Logs</h2>
-      <button class="link-btn" on:click={clearLogs} disabled={logs.length === 0}>Clear</button>
+      <div class="zoom-ctrl">
+        <button class="link-btn" on:click={spamTestLogs} title="Append 50 dummy entries to test scrolling">+50 test</button>
+        <span class="sep"></span>
+        <button class="link-btn" on:click={clearLogs} disabled={logs.length === 0}>Clear</button>
+      </div>
     </header>
     <div class="log-box" bind:this={logBox}>
       {#if logs.length === 0}

@@ -75,12 +75,16 @@ html, body {
   display: flex;
   gap: 16px;
   flex: 0 0 300px;
+  /* Pin the row's height — without min-height:0 a tall log list would
+   * stretch the row past its fixed flex-basis. */
+  min-height: 0;
 }
 
 .panel-connection {
   width: 400px;
   flex: 0 0 400px;
   overflow-y: auto;
+  min-height: 0;
 }
 .panel-connection::-webkit-scrollbar { width: 8px; }
 .panel-connection::-webkit-scrollbar-thumb {
@@ -96,6 +100,7 @@ html, body {
 .panel-logs {
   flex: 1;
   min-width: 0;
+  min-height: 0;
 }
 
 /* In-line "▸ Advanced" toggle that lives in the connection panel and
