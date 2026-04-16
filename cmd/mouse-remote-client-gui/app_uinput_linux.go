@@ -48,13 +48,21 @@ func requestUinputAccess() error {
 	//     mode back to 0660 root:input, leaving us locked out again.
 	//   - chown the live device to the calling user so this very process
 	//     can rw it before logging out.
+	// NOTE: the udev rule deliberately omits OPTIONS+="static_node=uinput".
+	// On some distros (we've seen this on user-reported Linux Mint / Ubuntu
+	// builds) the static node is created *before* the kernel module loads,
+	// and opening it returns a fd that succeeds at open() but rejects
+	// UI_SET_EVBIT with EINVAL. Forcing modprobe + chown gives a real fd.
 	script := fmt.Sprintf(`set -e
 mkdir -p /etc/udev/rules.d
 cat > /etc/udev/rules.d/99-uinput.rules <<'EOF'
-KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+KERNEL=="uinput", GROUP="input", MODE="0660"
 EOF
 udevadm control --reload-rules || true
 usermod -aG input %s || true
+# Force a clean reload so any stale static node is replaced by the real
+# device the kernel module exposes.
+modprobe -r uinput >/dev/null 2>&1 || true
 modprobe uinput || true
 udevadm settle || true
 if [ -e /dev/uinput ]; then
