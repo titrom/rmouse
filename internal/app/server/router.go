@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -339,6 +340,7 @@ func (r *Router) handleEvent(ev inputevent.Event, ctl inputevent.Ctl) {
 // that to the virtual cursor, then reset the OS cursor to the trap so
 // the next event once again reflects a fresh hardware delta.
 func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
+	prevVX, prevVY := r.vx, r.vy
 	if r.active == nil {
 		// Not grabbed — virtual cursor follows the real cursor.
 		// Edge-pushing detection: the OS clamps the cursor at the desktop
@@ -363,37 +365,57 @@ func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
 		// the visible "twitch in the corner" the user reported. Putting
 		// vx well inside the client's rect absorbs that jitter.
 		var crossed bool
+		var crossDir string
 		switch {
 		case pushRight:
 			r.vx, r.vy = r.serverMaxX+grabHysteresis, absY
 			crossed = true
+			crossDir = "right"
 		case pushLeft:
 			r.vx, r.vy = r.serverMinX-1-grabHysteresis, absY
 			crossed = true
+			crossDir = "left"
 		case pushBot:
 			r.vx, r.vy = absX, r.serverMaxY+grabHysteresis
 			crossed = true
+			crossDir = "bot"
 		case pushTop:
 			r.vx, r.vy = absX, r.serverMinY-1-grabHysteresis
 			crossed = true
+			crossDir = "top"
 		}
 		if !crossed {
 			r.vx, r.vy = absX, absY
 			r.lastAbsX, r.lastAbsY = absX, absY
 			r.haveLastAbs = true
+			slog.Info("router/move free",
+				"abs", fmt.Sprintf("(%d,%d)", absX, absY),
+				"v", fmt.Sprintf("(%d,%d)", r.vx, r.vy),
+				"pushR", pushRight, "pushL", pushLeft, "pushB", pushBot, "pushT", pushTop)
 			return
 		}
+		slog.Info("router/move cross attempt",
+			"abs", fmt.Sprintf("(%d,%d)", absX, absY),
+			"vBefore", fmt.Sprintf("(%d,%d)", prevVX, prevVY),
+			"vAfter", fmt.Sprintf("(%d,%d)", r.vx, r.vy),
+			"dir", crossDir)
 		r.resolveRegion(ctl)
 		if r.active != nil {
 			// Grab succeeded — trap the physical cursor at centre so we
 			// keep getting non-zero deltas.
 			_ = r.injector.MouseMoveAbs(r.trapX, r.trapY)
 			r.lastAbsX, r.lastAbsY = r.trapX, r.trapY
+			slog.Info("router/move grab on",
+				"client", r.active.name,
+				"v", fmt.Sprintf("(%d,%d)", r.vx, r.vy),
+				"trap", fmt.Sprintf("(%d,%d)", r.trapX, r.trapY))
 		} else {
 			// Grab not opened (no client placed in that direction). Update
 			// last-position bookkeeping so subsequent events still track.
 			r.lastAbsX, r.lastAbsY = absX, absY
 			r.haveLastAbs = true
+			slog.Info("router/move cross missed (no client at target)",
+				"v", fmt.Sprintf("(%d,%d)", r.vx, r.vy))
 		}
 		return
 	}
@@ -408,6 +430,11 @@ func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
 	r.vy += dy
 	_ = r.injector.MouseMoveAbs(r.trapX, r.trapY)
 	r.lastAbsX, r.lastAbsY = r.trapX, r.trapY
+	slog.Info("router/move grabbed",
+		"client", r.active.name,
+		"abs", fmt.Sprintf("(%d,%d)", absX, absY),
+		"d", fmt.Sprintf("(%+d,%+d)", dx, dy),
+		"v", fmt.Sprintf("(%d,%d)", r.vx, r.vy))
 	r.resolveRegion(ctl)
 }
 
@@ -425,9 +452,13 @@ func (r *Router) resolveRegion(ctl inputevent.Ctl) {
 		// Hide the host cursor: while grabbed it sits parked at the trap point
 		// and would otherwise hover visibly in the centre of the screen.
 		_ = r.injector.SetCursorVisible(false)
+		slog.Info("router/region grab acquired", "client", target.name,
+			"v", fmt.Sprintf("(%d,%d)", r.vx, r.vy))
 
 	case target == nil && r.active != nil:
 		// Returning to the server — restore local cursor at the boundary.
+		releasedFrom := r.active.name
+		preClampVX, preClampVY := r.vx, r.vy
 		_ = r.active.session.Send(&proto.Grab{On: false})
 		r.active = nil
 		ctl.SetConsume(false)
@@ -442,13 +473,19 @@ func (r *Router) resolveRegion(ctl inputevent.Ctl) {
 		_ = r.injector.MouseMoveAbs(r.vx, r.vy)
 		r.lastAbsX, r.lastAbsY = r.vx, r.vy
 		_ = r.injector.SetCursorVisible(true)
+		slog.Info("router/region grab released", "client", releasedFrom,
+			"vExit", fmt.Sprintf("(%d,%d)", preClampVX, preClampVY),
+			"vParked", fmt.Sprintf("(%d,%d)", r.vx, r.vy))
 
 	case target != nil && r.active != nil && target != r.active:
 		// Crossed between two clients.
+		from := r.active.name
 		_ = r.active.session.Send(&proto.Grab{On: false})
 		r.active = target
 		_ = target.session.Send(&proto.Grab{On: true})
 		r.sendAbs(target)
+		slog.Info("router/region client switch", "from", from, "to", target.name,
+			"v", fmt.Sprintf("(%d,%d)", r.vx, r.vy))
 
 	case target != nil && r.active != nil:
 		// Still in the same client — just update position.
@@ -487,10 +524,12 @@ func (r *Router) clientAt(x, y int32) *routerClient {
 
 // grabHysteresis is the pixel buffer applied on grab transitions. On cross-in
 // the virtual cursor is pushed this far past the boundary so subsequent
-// jitter doesn't immediately exit; on release it is parked this far inside
-// server bounds for the symmetric reason. 16 covers wireless-mouse noise
-// while staying invisible at typical pointer speeds.
-const grabHysteresis int32 = 16
+// motion doesn't immediately exit; on release it is parked this far inside
+// server bounds for the symmetric reason. Sized to absorb a single hook
+// event's worth of motion at typical high-DPI gaming mice (~1600–3200
+// counts/in produce 30–80px per event during normal pointing); below this
+// the cursor oscillates at the boundary on every flick.
+const grabHysteresis int32 = 100
 
 // padInsideServer pulls (x, y) at least grabHysteresis pixels away from any
 // server bbox edge it sits at. Used after releasing grab so the next at-edge

@@ -4,6 +4,9 @@ package main
 
 import (
 	"embed"
+	"log/slog"
+	"os"
+	"path/filepath"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -17,6 +20,16 @@ import (
 var assets embed.FS
 
 func main() {
+	// Wails on Windows is a GUI subsystem app — no console attached, so
+	// stderr is /dev/null. Tee slog to a file in TempDir so the router's
+	// per-event coords are inspectable; tail with `Get-Content -Wait` or
+	// `tail -f` on the printed path.
+	logPath := filepath.Join(os.TempDir(), "rmouse-server.log")
+	if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+		slog.SetDefault(slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo})))
+		slog.Info("rmouse-server-gui boot", "logPath", logPath)
+	}
+
 	app := NewApp()
 
 	err := wails.Run(&options.App{
