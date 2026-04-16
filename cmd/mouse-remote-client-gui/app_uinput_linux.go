@@ -39,23 +39,29 @@ func requestUinputAccess() error {
 	if username == "" {
 		return fmt.Errorf("could not determine current user")
 	}
-	// Single shell snippet:
+	// One self-contained snippet under pkexec:
 	//   - persistent udev rule for the next reboot
-	//   - module load (no-op if already loaded)
-	//   - reload + retrigger so the rule applies right away
-	//   - usermod for future sessions
-	//   - immediate chmod so this very process can use uinput before relogin
+	//   - usermod for future logins
+	//   - modprobe to make sure /dev/uinput exists right now
+	//   - udevadm settle, NOT trigger: trigger is async and races with the
+	//     chmod/chown below — udev finishes after we exit and resets the
+	//     mode back to 0660 root:input, leaving us locked out again.
+	//   - chown the live device to the calling user so this very process
+	//     can rw it before logging out.
 	script := fmt.Sprintf(`set -e
 mkdir -p /etc/udev/rules.d
 cat > /etc/udev/rules.d/99-uinput.rules <<'EOF'
 KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
 EOF
-modprobe uinput || true
 udevadm control --reload-rules || true
-udevadm trigger || true
 usermod -aG input %s || true
-[ -e /dev/uinput ] && chmod 0666 /dev/uinput || true
-`, shellQuote(username))
+modprobe uinput || true
+udevadm settle || true
+if [ -e /dev/uinput ]; then
+  chown %s /dev/uinput || true
+  chmod 0600 /dev/uinput || true
+fi
+`, shellQuote(username), shellQuote(username))
 
 	cmd := exec.Command("pkexec", "sh", "-c", script)
 	out, err := cmd.CombinedOutput()
