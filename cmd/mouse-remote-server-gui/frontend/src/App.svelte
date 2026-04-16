@@ -184,11 +184,15 @@
       const top    = tTop   - cMaxY;
       const freeY = Math.min(tBot   - cMinY - 1, Math.max(tTop  - cMaxY + 1, c.offY));
       const freeX = Math.min(tRight - cMinX - 1, Math.max(tLeft - cMaxX + 1, c.offX));
+      // Cardinal-only anchors. Corner placements (e.g. col=1,row=-1) make
+      // the router's clientAt fail when the user pushes the cursor past a
+      // pure side edge — the cursor's perpendicular coord lands outside
+      // the diagonally-placed client's rect. By skipping corner anchors
+      // we force every snap to be a flush side, which cleanly maps to
+      // (col,row) where exactly one of them is zero.
       anchors.push(
         { x: right, y: freeY }, { x: left,  y: freeY },
         { x: freeX, y: top   }, { x: freeX, y: bottom },
-        { x: right, y: top   }, { x: right, y: bottom },
-        { x: left,  y: top   }, { x: left,  y: bottom },
       );
     }
 
@@ -212,6 +216,18 @@
         const sh = serverBbox.maxY - serverBbox.minY || 1;
         let col = Math.round((c.offX + cMinX - serverBbox.minX) / sw);
         let row = Math.round((c.offY + cMinY - serverBbox.minY) / sh);
+        // Cardinal-flush only: zero out the smaller axis so col=±1,row=0 or
+        // col=0,row=±1, matching the cardinal-only anchor set above. This
+        // prevents diagonal placements that would route the cursor past a
+        // client whose monitor rect doesn't intersect the edge being pushed.
+        if (col !== 0 && row !== 0) {
+          if (Math.abs(col) >= Math.abs(row)) row = 0;
+          else col = 0;
+        }
+        // Clamp magnitude to 1 — placement further out than one cell yields
+        // a gap the router can never bridge from a side edge.
+        col = Math.max(-1, Math.min(1, col));
+        row = Math.max(-1, Math.min(1, row));
         if (col === 0 && row === 0) col = 1; // (0,0) is reserved for the server.
         c.col = col;
         c.row = row;

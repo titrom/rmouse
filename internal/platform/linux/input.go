@@ -30,7 +30,7 @@ type Injector struct {
 // every syncEvery unchecked requests. Each Sync is a sub-millisecond local
 // X roundtrip, so amortised it spreads what would have been a single ~1ms
 // stall across many invisible nudges.
-const syncEvery = 32
+const syncEvery = 8
 
 // NewInjector opens an X connection from $DISPLAY, initialises the XTest
 // extension, and remembers the default screen's root window for absolute

@@ -341,36 +341,39 @@ func (r *Router) handleEvent(ev inputevent.Event, ctl inputevent.Ctl) {
 func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
 	if r.active == nil {
 		// Not grabbed — virtual cursor follows the real cursor.
-		pushingEdge := r.haveLastAbs && absX == r.lastAbsX && absY == r.lastAbsY
-		if !pushingEdge {
-			r.vx, r.vy = absX, absY
-			r.lastAbsX, r.lastAbsY = absX, absY
-			r.haveLastAbs = true
-			return
-		}
-		// Cursor didn't move but a hardware event fired — pushing at a wall.
-		// Pick which edge is being pushed and project the virtual cursor
-		// just past it so resolveRegion can find a client placed in that
-		// direction. Right/bottom edges are inclusive of MaxX/MaxY (where
-		// a flush-right/flush-below client's left/top sits); left/top edges
-		// need a -1 step to land *inside* a client whose right/bottom is
-		// at serverMinX/Y (exclusive in the clientAt rect test).
+		// Edge-pushing detection: the OS clamps the cursor at the desktop
+		// boundary, so any continued hardware motion against the wall lands
+		// at the same absolute coord. We previously required the *whole*
+		// position to be unchanged (absX & absY both equal to last), which
+		// failed on a low-DPI / slow-handed mouse where the perpendicular
+		// axis often inches by ±1px between hook events. Now: an axis is
+		// "stuck against its edge" if both this event AND the previous one
+		// sit at that bound, regardless of the other axis. Cross only after
+		// two consecutive at-edge samples so a single edge-touch on normal
+		// pointing doesn't trigger a stray grab.
+		pushRight := absX >= r.serverMaxX-1 && r.haveLastAbs && r.lastAbsX >= r.serverMaxX-1
+		pushLeft := absX <= r.serverMinX && r.haveLastAbs && r.lastAbsX <= r.serverMinX
+		pushBot := absY >= r.serverMaxY-1 && r.haveLastAbs && r.lastAbsY >= r.serverMaxY-1
+		pushTop := absY <= r.serverMinY && r.haveLastAbs && r.lastAbsY <= r.serverMinY
 		var crossed bool
 		switch {
-		case absX >= r.serverMaxX-1:
+		case pushRight:
 			r.vx, r.vy = r.serverMaxX, absY
 			crossed = true
-		case absX <= r.serverMinX:
+		case pushLeft:
 			r.vx, r.vy = r.serverMinX-1, absY
 			crossed = true
-		case absY >= r.serverMaxY-1:
+		case pushBot:
 			r.vx, r.vy = absX, r.serverMaxY
 			crossed = true
-		case absY <= r.serverMinY:
+		case pushTop:
 			r.vx, r.vy = absX, r.serverMinY-1
 			crossed = true
 		}
 		if !crossed {
+			r.vx, r.vy = absX, absY
+			r.lastAbsX, r.lastAbsY = absX, absY
+			r.haveLastAbs = true
 			return
 		}
 		r.resolveRegion(ctl)
@@ -379,6 +382,11 @@ func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
 			// keep getting non-zero deltas.
 			_ = r.injector.MouseMoveAbs(r.trapX, r.trapY)
 			r.lastAbsX, r.lastAbsY = r.trapX, r.trapY
+		} else {
+			// Grab not opened (no client placed in that direction). Update
+			// last-position bookkeeping so subsequent events still track.
+			r.lastAbsX, r.lastAbsY = absX, absY
+			r.haveLastAbs = true
 		}
 		return
 	}
