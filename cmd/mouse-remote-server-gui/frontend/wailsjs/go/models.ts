@@ -44,8 +44,8 @@ export namespace main {
 	}
 	export class PlacementDTO {
 	    name: string;
-	    col: number;
-	    row: number;
+	    x: number;
+	    y: number;
 	
 	    static createFrom(source: any = {}) {
 	        return new PlacementDTO(source);
@@ -54,8 +54,8 @@ export namespace main {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
-	        this.col = source["col"];
-	        this.row = source["row"];
+	        this.x = source["x"];
+	        this.y = source["y"];
 	    }
 	}
 

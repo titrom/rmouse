@@ -28,16 +28,33 @@
   let stageW = 0, stageH = 0;
   // User zoom multiplier on top of the auto fit-to-stage scale.
   let zoom = 1;
+  // Grid step in world units (virtual-desktop px). Drag-drop snaps the
+  // client's monitor-bbox top-left to the nearest multiple. Persisted
+  // via localStorage — purely a GUI concern, the router doesn't care
+  // about the spacing, only about the final (x, y) we send it.
+  const GRID_STEP_KEY = "rmouse.gridStep";
+  const GRID_STEP_DEFAULT = 240;
+  let gridStep: number = (() => {
+    const v = Number(localStorage.getItem(GRID_STEP_KEY));
+    return Number.isFinite(v) && v > 0 ? v : GRID_STEP_DEFAULT;
+  })();
+  $: if (gridStep > 0) localStorage.setItem(GRID_STEP_KEY, String(gridStep));
 
-  // Two flavors of clients on the stage:
-  // - stub: synthetic, free-form drag/snap, never persists.
-  // - live: real connected client; drag/snap calls SetClientPlacement and
-  //   the local offset mirrors the router's cell-grid formula so the
-  //   visual matches the actual mouse-transition geometry.
+  // Both client flavors share the same positioning model: offX/offY is
+  // the translation applied to the client's own monitor coords, so
+  // (monitor.x + offX, monitor.y + offY) is the world position. Live
+  // clients additionally persist via SetClientPlacement as absolute world
+  // coords (worldX = offX + cMinX, worldY = offY + cMinY).
   type StubClient = { kind: "stub"; name: string; offX: number; offY: number; monitors: main.MonitorDTO[] };
   type LiveClient = {
     kind: "live"; name: string; ids: string[]; remote: string;
-    col: number; row: number; offX: number; offY: number; monitors: main.MonitorDTO[];
+    // Persisted placement: absolute world coords of the client's
+    // monitor-bbox top-left. Independent of draggable offX/offY so a
+    // mid-drag bump doesn't lose the snapshot, and so we can re-derive
+    // offX/offY after monitors arrive (placement may load before the
+    // client has connected).
+    worldX: number; worldY: number;
+    offX: number; offY: number; monitors: main.MonitorDTO[];
   };
   type AnyClient = StubClient | LiveClient;
   let stubClients: StubClient[] = [];
@@ -50,25 +67,25 @@
     liveClients = liveClients;
     stubClients = stubClients;
   }
-  // Mirror internal/app/server/router.go::applyPlacementAt so the visual
-  // offset matches where the router will actually send the cursor. Edge-
-  // aligned: col=+1 puts the client's left flush against serverMaxX,
-  // col=-1 its right against serverMinX, col=0 its left against serverMinX
-  // (rows analogous). The earlier "one server-bbox per cell" formula left
-  // a gap on negative cells that broke cursor handoff into above/left
-  // clients.
-  function liveOffsetFromCell(c: LiveClient) {
-    if (monitors.length === 0 || c.monitors.length === 0) return;
-    const cMinX = Math.min(...c.monitors.map(m => m.x));
-    const cMinY = Math.min(...c.monitors.map(m => m.y));
-    const cMaxX = Math.max(...c.monitors.map(m => m.x + m.w));
-    const cMaxY = Math.max(...c.monitors.map(m => m.y + m.h));
-    c.offX = c.col > 0 ? serverBbox.maxX - cMinX
-           : c.col < 0 ? serverBbox.minX - cMaxX
-           : serverBbox.minX - cMinX;
-    c.offY = c.row > 0 ? serverBbox.maxY - cMinY
-           : c.row < 0 ? serverBbox.minY - cMaxY
-           : serverBbox.minY - cMinY;
+  // clientBbox returns the client's monitor bbox in its own coord system
+  // (before offX/offY translation).
+  function clientBbox(c: AnyClient) {
+    if (c.monitors.length === 0) return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+    return {
+      minX: Math.min(...c.monitors.map(m => m.x)),
+      minY: Math.min(...c.monitors.map(m => m.y)),
+      maxX: Math.max(...c.monitors.map(m => m.x + m.w)),
+      maxY: Math.max(...c.monitors.map(m => m.y + m.h)),
+    };
+  }
+  // Seed a live client from a stored placement — world coords of the
+  // monitor-bbox top-left. offX/offY is the translation; monitors may
+  // still be empty when this runs (placement loaded before the client
+  // has connected), in which case we assume cMinX = cMinY = 0.
+  function applyLivePlacement(c: LiveClient, worldX: number, worldY: number) {
+    const bb = clientBbox(c);
+    c.offX = worldX - bb.minX;
+    c.offY = worldY - bb.minY;
   }
   let nextStubId = 1;
   function addTestClient() {
@@ -121,6 +138,12 @@
     client: AnyClient; startMouseX: number; startMouseY: number;
     startOffX: number; startOffY: number;
   } | null = null;
+
+  // Graph-paper grid shown while dragging. Cell size matches the dragged
+  // client's monitor bbox (one cell == one screen's worth of space) so the
+  // grid visually corresponds to the router's (col, row) placement step,
+  // which is also client-sized (see applyPlacementAt). Aligned to world
+  // origin so the grid feels anchored to the scene at every zoom level.
   function onMonMouseDown(ev: MouseEvent, d: Drawable) {
     if (d.kind !== "client" || !d.clientName) return;
     const c = findClient(d.clientName);
@@ -166,6 +189,30 @@
   // targets distinct from the larger primary's. We build all candidates,
   // pick the nearest non-colliding, and re-fit zoom afterwards so the
   // newly-extended layout stays visible.
+  // Ring-search outward on the grid from (startX, startY) for the first
+  // non-colliding position. startX/startY are world coords of the
+  // client's monitor-bbox top-left. Returns null if nothing found within
+  // `maxRings` rings — caller should then revert to drag-start.
+  function findFreeGridSpot(c: AnyClient, startX: number, startY: number, step: number): { x: number; y: number } | null {
+    const bb = clientBbox(c);
+    const maxRings = 30;
+    for (let r = 1; r <= maxRings; r++) {
+      // Walk the perimeter of ring r. For small rings this scans every
+      // cell; for larger rings we skip interior to avoid re-testing.
+      for (let dx = -r; dx <= r; dx++) {
+        for (let dy = -r; dy <= r; dy++) {
+          if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue; // perimeter only
+          const x = startX + dx * step;
+          const y = startY + dy * step;
+          if (!clientCollides(c.monitors, x - bb.minX, y - bb.minY, c.name)) {
+            return { x, y };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   function snapClient(c: AnyClient) {
     if (monitors.length === 0) return;
     const cMinX = Math.min(...c.monitors.map(m => m.x));
@@ -173,6 +220,45 @@
     const cMinY = Math.min(...c.monitors.map(m => m.y));
     const cMaxY = Math.max(...c.monitors.map(m => m.y + m.h));
 
+    // Live clients: free placement. The client's monitor-bbox top-left
+    // is snapped to the nearest grid intersection (step = gridStep). If
+    // that intersection would overlap the server or another client —
+    // e.g. grid rounding pulled it into the server despite the drag
+    // collision guard — we ring-search outward on the grid for the
+    // nearest non-colliding cell, keeping the client on-grid but never
+    // on top of the host screen.
+    if (c.kind === "live") {
+      const worldX = c.offX + cMinX;
+      const worldY = c.offY + cMinY;
+      const step = Math.max(1, gridStep);
+      let snappedX = Math.round(worldX / step) * step;
+      let snappedY = Math.round(worldY / step) * step;
+      if (clientCollides(c.monitors, snappedX - cMinX, snappedY - cMinY, c.name)) {
+        const spot = findFreeGridSpot(c, snappedX, snappedY, step);
+        if (spot) { snappedX = spot.x; snappedY = spot.y; }
+        else {
+          // No free spot within search radius — revert to drag start.
+          if (dragging) { snappedX = dragging.startOffX + cMinX; snappedY = dragging.startOffY + cMinY; }
+        }
+      }
+      snapping.add(c.name);
+      snapping = snapping;
+      c.worldX = snappedX;
+      c.worldY = snappedY;
+      c.offX = snappedX - cMinX;
+      c.offY = snappedY - cMinY;
+      if (zoom !== 1) zoom = 1;
+      SetClientPlacement(c.name, snappedX, snappedY).catch((err) => {
+        log("error", `placement: ${err}`);
+      });
+      bumpClients();
+      setTimeout(() => { snapping.delete(c.name); snapping = snapping; }, 320);
+      return;
+    }
+
+    // Stub clients (synthetic test screens) keep the flush-to-edge snap —
+    // useful for layout experiments where you want to butt screens up
+    // against each other without pixel-precision drag.
     type Anchor = { x: number; y: number };
     const anchors: Anchor[] = [];
     // Targets to snap against: every server monitor + every monitor of
@@ -193,15 +279,18 @@
       const top    = tTop   - cMaxY;
       const freeY = Math.min(tBot   - cMinY - 1, Math.max(tTop  - cMaxY + 1, c.offY));
       const freeX = Math.min(tRight - cMinX - 1, Math.max(tLeft - cMaxX + 1, c.offX));
-      // Cardinal-only anchors. Corner placements (e.g. col=1,row=-1) make
-      // the router's clientAt fail when the user pushes the cursor past a
-      // pure side edge — the cursor's perpendicular coord lands outside
-      // the diagonally-placed client's rect. By skipping corner anchors
-      // we force every snap to be a flush side, which cleanly maps to
-      // (col,row) where exactly one of them is zero.
+      // Side-flush anchors plus corner anchors. Corners let the user place
+      // a client diagonally (col≠0 AND row≠0) — router::applyPlacementAt
+      // handles both axes independently, so (1,1) lands flush to the
+      // server's bottom-right corner. Diagonal placements are only reached
+      // by corner cursor crossings (a pure side-cross won't enter them),
+      // but they're useful for multi-client layouts where the user wants
+      // to fill in corner cells.
       anchors.push(
         { x: right, y: freeY }, { x: left,  y: freeY },
         { x: freeX, y: top   }, { x: freeX, y: bottom },
+        { x: right, y: top   }, { x: right, y: bottom },
+        { x: left,  y: top   }, { x: left,  y: bottom },
       );
     }
 
@@ -216,33 +305,6 @@
       c.offX = p.x;
       c.offY = p.y;
       if (zoom !== 1) zoom = 1;
-      // Live clients persist via the router's (col, row) cell grid. The
-      // snap above already produced an edge-aligned offset, so we infer
-      // the cell from which side of the server bbox the client's midpoint
-      // landed on. Then liveOffsetFromCell re-derives offX/offY using the
-      // exact same formula as the router so the visual matches the cursor
-      // landing point.
-      if (c.kind === "live") {
-        const midX = c.offX + (cMinX + cMaxX) / 2;
-        const midY = c.offY + (cMinY + cMaxY) / 2;
-        let col = midX >= serverBbox.maxX ? 1 : midX <= serverBbox.minX ? -1 : 0;
-        let row = midY >= serverBbox.maxY ? 1 : midY <= serverBbox.minY ? -1 : 0;
-        // Cardinal-flush only: zero out the smaller axis so col=±1,row=0 or
-        // col=0,row=±1. Diagonal placements would route the cursor past a
-        // client whose monitor rect doesn't intersect the edge being pushed.
-        if (col !== 0 && row !== 0) {
-          const dx = col > 0 ? midX - serverBbox.maxX : serverBbox.minX - midX;
-          const dy = row > 0 ? midY - serverBbox.maxY : serverBbox.minY - midY;
-          if (dx >= dy) row = 0; else col = 0;
-        }
-        if (col === 0 && row === 0) col = 1; // (0,0) is reserved for the server.
-        c.col = col;
-        c.row = row;
-        liveOffsetFromCell(c);
-        SetClientPlacement(c.name, col, row).catch((err) => {
-          log("error", `placement: ${err}`);
-        });
-      }
       bumpClients();
       setTimeout(() => { snapping.delete(c.name); snapping = snapping; }, 320);
       return;
@@ -338,6 +400,126 @@
   $: offsetY = !anyClient
     ? stageH / 2
     : stageH / 2 - ((bbox.minY + bbox.maxY) / 2) * scale;
+  // Grid halo — instead of tiling the whole stage, we render only a
+  // limited band of cells around each existing monitor (server + other
+  // clients), `haloDepth` cells deep in each cardinal direction. Gives
+  // the user a hint of valid snap positions next to existing screens
+  // without drowning the view in wallpaper.
+  const haloDepth = 3;
+  type GridCell = { key: string; x: number; y: number; w: number; h: number };
+  $: gridCells = (() => {
+    liveClients; stubClients; // reactive deps (same pattern as ghostCells)
+    if (!dragging) return [] as GridCell[];
+    const step = Math.max(1, gridStep);
+    const dragName = dragging.client.name;
+    // Collect anchor rects: server monitors + every other client's monitors.
+    const anchors: { x: number; y: number; w: number; h: number }[] = [];
+    for (const m of monitors) anchors.push({ x: m.x, y: m.y, w: m.w, h: m.h });
+    for (const oc of [...liveClients, ...stubClients]) {
+      if (oc.name === dragName) continue;
+      for (const om of oc.monitors) {
+        anchors.push({ x: om.x + oc.offX, y: om.y + oc.offY, w: om.w, h: om.h });
+      }
+    }
+    const cells = new Map<string, GridCell>();
+    for (const a of anchors) {
+      // Snap anchor edges to the nearest grid multiple so the halo aligns.
+      const aLeftCol  = Math.floor(a.x / step);
+      const aRightCol = Math.ceil((a.x + a.w) / step);
+      const aTopRow   = Math.floor(a.y / step);
+      const aBotRow   = Math.ceil((a.y + a.h) / step);
+      // Right halo
+      for (let col = aRightCol; col < aRightCol + haloDepth; col++)
+        for (let row = aTopRow - 1; row < aBotRow + 1; row++) {
+          const key = `${col},${row}`;
+          if (!cells.has(key)) cells.set(key, { key, x: col * step, y: row * step, w: step, h: step });
+        }
+      // Left halo
+      for (let col = aLeftCol - 1; col >= aLeftCol - haloDepth; col--)
+        for (let row = aTopRow - 1; row < aBotRow + 1; row++) {
+          const key = `${col},${row}`;
+          if (!cells.has(key)) cells.set(key, { key, x: col * step, y: row * step, w: step, h: step });
+        }
+      // Top halo
+      for (let row = aTopRow - 1; row >= aTopRow - haloDepth; row--)
+        for (let col = aLeftCol; col < aRightCol; col++) {
+          const key = `${col},${row}`;
+          if (!cells.has(key)) cells.set(key, { key, x: col * step, y: row * step, w: step, h: step });
+        }
+      // Bottom halo
+      for (let row = aBotRow; row < aBotRow + haloDepth; row++)
+        for (let col = aLeftCol; col < aRightCol; col++) {
+          const key = `${col},${row}`;
+          if (!cells.has(key)) cells.set(key, { key, x: col * step, y: row * step, w: step, h: step });
+        }
+    }
+    // Drop cells that would overlap any anchor — a halo cell sitting
+    // inside a monitor would misleadingly suggest that spot is free.
+    const out: GridCell[] = [];
+    for (const cell of cells.values()) {
+      let overlaps = false;
+      for (const a of anchors) {
+        if (cell.x < a.x + a.w && cell.x + cell.w > a.x &&
+            cell.y < a.y + a.h && cell.y + cell.h > a.y) { overlaps = true; break; }
+      }
+      if (!overlaps) out.push(cell);
+    }
+    return out;
+  })();
+
+  // Cells the dragged client would cover after snap — used to highlight
+  // the drop target. Each cell is one gridStep × gridStep rect at world
+  // (col*gridStep, row*gridStep). Reads live c.offX/c.offY via findClient
+  // so it tracks the ongoing drag: we re-lookup through `liveClients` /
+  // `stubClients` to establish a reactive dependency on those arrays
+  // (bumpClients reassigns them on every mousemove, which triggers this
+  // recompute; depending only on `dragging` wouldn't since its .client
+  // reference is stable throughout the drag).
+  type GhostCell = { key: string; x: number; y: number; w: number; h: number };
+  $: ghostCells = (() => {
+    liveClients; stubClients; // reactive deps
+    if (!dragging) return [] as GhostCell[];
+    const c = findClient(dragging.client.name) ?? dragging.client;
+    if (c.monitors.length === 0) return [] as GhostCell[];
+    const bb = clientBbox(c);
+    const worldX = c.offX + bb.minX;
+    const worldY = c.offY + bb.minY;
+    const step = Math.max(1, gridStep);
+    const snappedX = Math.round(worldX / step) * step;
+    const snappedY = Math.round(worldY / step) * step;
+    const cW = bb.maxX - bb.minX;
+    const cH = bb.maxY - bb.minY;
+    const col0 = Math.floor(snappedX / step);
+    const row0 = Math.floor(snappedY / step);
+    const col1 = Math.ceil((snappedX + cW) / step);
+    const row1 = Math.ceil((snappedY + cH) / step);
+    const cells: GhostCell[] = [];
+    for (let col = col0; col < col1; col++) {
+      for (let row = row0; row < row1; row++) {
+        cells.push({
+          key: `${col},${row}`,
+          x: col * step, y: row * step,
+          w: step, h: step,
+        });
+      }
+    }
+    return cells;
+  })();
+  // Ghost outline showing the exact rect where the client will land.
+  $: ghostRect = (() => {
+    liveClients; stubClients; // reactive deps (see ghostCells above)
+    if (!dragging) return null;
+    const c = findClient(dragging.client.name) ?? dragging.client;
+    if (c.monitors.length === 0) return null;
+    const bb = clientBbox(c);
+    const worldX = c.offX + bb.minX;
+    const worldY = c.offY + bb.minY;
+    const step = Math.max(1, gridStep);
+    const snappedX = Math.round(worldX / step) * step;
+    const snappedY = Math.round(worldY / step) * step;
+    return { x: snappedX, y: snappedY, w: bb.maxX - bb.minX, h: bb.maxY - bb.minY };
+  })();
+
   // Visual gap between adjacent monitors — each rectangle is inset by
   // gap/2 on every side so two touching screens show a thin breathing
   // space without distorting their relative positions.
@@ -356,28 +538,14 @@
         if (seen.has(p.name)) continue;
         liveClients.push({
           kind: "live", name: p.name, ids: [], remote: "",
-          col: p.col, row: p.row, offX: 0, offY: 0, monitors: [],
+          worldX: p.x, worldY: p.y, offX: p.x, offY: p.y, monitors: [],
         });
       }
       bumpClients();
     } catch (e) { /* placements may not exist yet */ }
   }
-  // When the server's own monitor layout changes, every live client's
-  // offset (which is anchored to serverMin/serverW/serverH) becomes stale.
-  // Recompute from the stored (col, row). NOTE: depend ONLY on `monitors`,
-  // not `liveClients` — otherwise a drag-induced bump would re-trigger
-  // this and snap the offset back to the cell on every mousemove.
-  let lastMonsKey = "";
-  $: {
-    const key = monitors.map(m => `${m.id}:${m.x},${m.y},${m.w},${m.h}`).join("|");
-    if (key !== lastMonsKey) {
-      lastMonsKey = key;
-      if (monitors.length > 0) {
-        for (const c of liveClients) liveOffsetFromCell(c);
-        bumpClients();
-      }
-    }
-  }
+  // With absolute world-coord placements, server layout changes don't
+  // move clients — their worldX/worldY stays fixed. No recompute needed.
   const maxZoom = 5;
   // Minimum on-screen size a monitor rectangle must keep so its label
   // (name + WxH on two lines) doesn't get clipped. Tuned to the .mon-label
@@ -491,18 +659,19 @@
     }
   }
   function onPlaced(p: any) {
-    log("info", `placed ${p?.name ?? p?.id} → (${p?.col}, ${p?.row})`);
+    log("info", `placed ${p?.name ?? p?.id} → (${p?.x}, ${p?.y})`);
     if (!p?.name) return;
     let c = liveClients.find(c => c.name === p.name);
     if (!c) {
-      // Placement arrived before connection — seed an empty entry; offset
-      // is meaningless until monitors arrive via 'connected'.
+      // Placement arrived before connection — seed an empty entry.
+      // offX/offY fall back to worldX/worldY until monitors arrive (at
+      // which point upsertLive re-derives them via applyLivePlacement).
       c = { kind: "live", name: p.name, ids: [], remote: "",
-            col: p.col, row: p.row, offX: 0, offY: 0, monitors: [] };
+            worldX: p.x, worldY: p.y, offX: p.x, offY: p.y, monitors: [] };
       liveClients = [...liveClients, c];
     } else {
-      c.col = p.col; c.row = p.row;
-      liveOffsetFromCell(c);
+      c.worldX = p.x; c.worldY = p.y;
+      applyLivePlacement(c, p.x, p.y);
     }
     bumpClients();
   }
@@ -515,15 +684,18 @@
     const mons = Array.isArray(p?.monitors) ? p.monitors as main.MonitorDTO[] : [];
     let c = liveClients.find(c => c.name === p.name);
     if (!c) {
+      // Router already auto-assigned a placement and emitted clientPlaced;
+      // onPlaced should have seeded worldX/worldY. If we raced ahead, fall
+      // back to (0, 0) — the next placement event will correct it.
       c = { kind: "live", name: p.name, ids: [], remote: p.remote || "",
-            col: 0, row: 0, offX: 0, offY: 0, monitors: mons };
+            worldX: 0, worldY: 0, offX: 0, offY: 0, monitors: mons };
       liveClients = [...liveClients, c];
     } else {
       c.monitors = mons;
       c.remote = p.remote || c.remote;
     }
     if (p.id && !c.ids.includes(p.id)) c.ids.push(p.id);
-    liveOffsetFromCell(c);
+    applyLivePlacement(c, c.worldX, c.worldY);
     bumpClients();
   }
   function removeLiveId(p: any) {
@@ -653,6 +825,18 @@
     <header class="panel-head">
       <h2>Screen</h2>
       <div class="zoom-ctrl">
+        <label class="grid-step-field" title="Grid cell size (virtual-desktop px). Drag snaps to multiples.">
+          grid
+          <input
+            type="number"
+            class="grid-step-input"
+            min="1"
+            step="10"
+            bind:value={gridStep}
+          />
+          px
+        </label>
+        <span class="sep"></span>
         <button class="link-btn" on:click={addTestClient} title="Add a stub client for layout testing">+ test client</button>
         <span class="sep"></span>
         <button class="link-btn" on:click={() => zoom = Math.max(minZoom, zoom / 1.2)} title="Zoom out" disabled={zoom <= minZoom}>−</button>
@@ -660,10 +844,43 @@
         <button class="link-btn" on:click={() => zoom = Math.min(maxZoom, zoom * 1.2)} title="Zoom in" disabled={zoom >= maxZoom}>+</button>
       </div>
     </header>
-    <div class="stage" class:snapping={snapping.size > 0} bind:this={stage} on:wheel={onWheel}>
+    <div
+      class="stage"
+      class:snapping={snapping.size > 0}
+      class:dragging={dragging !== null}
+      bind:this={stage}
+      on:wheel={onWheel}
+    >
       {#if drawables.length === 0}
         <p class="log-empty stage-empty">No monitors detected.</p>
       {:else}
+        {#each gridCells as gc (gc.key)}
+          <div class="grid-cell"
+            style="
+              left:   {(gc.x - originX) * scale + offsetX}px;
+              top:    {(gc.y - originY) * scale + offsetY}px;
+              width:  {gc.w * scale}px;
+              height: {gc.h * scale}px;
+            "></div>
+        {/each}
+        {#each ghostCells as gc (gc.key)}
+          <div class="ghost-cell"
+            style="
+              left:   {(gc.x - originX) * scale + offsetX}px;
+              top:    {(gc.y - originY) * scale + offsetY}px;
+              width:  {gc.w * scale}px;
+              height: {gc.h * scale}px;
+            "></div>
+        {/each}
+        {#if ghostRect}
+          <div class="ghost-rect"
+            style="
+              left:   {(ghostRect.x - originX) * scale + offsetX}px;
+              top:    {(ghostRect.y - originY) * scale + offsetY}px;
+              width:  {ghostRect.w * scale}px;
+              height: {ghostRect.h * scale}px;
+            "></div>
+        {/if}
         {#each drawables as d (d.key)}
           <div
             class="mon mon-{d.kind}"

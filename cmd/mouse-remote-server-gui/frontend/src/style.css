@@ -272,6 +272,81 @@ html, body {
 }
 .mon-close:hover { background: rgba(180, 70, 70, 0.30); color: #6e2a2a; }
 
+/* Grid halo cells — shown only during drag, as a localised band of
+ * placement hints around every existing monitor. Each cell is a thin
+ * dashed outline so the grid reads as "here you can attach" without
+ * taking over the view. */
+.grid-cell {
+  position: absolute;
+  border: 1px dashed rgba(70, 110, 170, 0.45);
+  background: rgba(70, 110, 170, 0.04);
+  pointer-events: none;
+  box-sizing: border-box;
+  opacity: 0;
+  animation: grid-cell-fade 160ms ease-out forwards;
+  z-index: 0;
+}
+@keyframes grid-cell-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.stage .mon { z-index: 2; }
+
+/* Cells the dragged client will cover after snap — drop-target
+ * highlights. Rendered as positioned divs so CSS can pulse them. */
+.ghost-cell {
+  position: absolute;
+  background: rgba(70, 140, 220, 0.14);
+  border: 1px solid rgba(70, 140, 220, 0.45);
+  pointer-events: none;
+  z-index: 1;
+  animation: ghost-cell-pulse 900ms ease-in-out infinite alternate;
+}
+@keyframes ghost-cell-pulse {
+  from { background: rgba(70, 140, 220, 0.10); }
+  to   { background: rgba(70, 140, 220, 0.22); }
+}
+
+/* Outline of the exact rect where the client will land on drop — a
+ * stronger visual cue than the coarse per-cell fills. */
+.ghost-rect {
+  position: absolute;
+  border: 2px solid rgba(70, 140, 220, 0.85);
+  background: rgba(70, 140, 220, 0.08);
+  border-radius: 4px;
+  pointer-events: none;
+  box-shadow: 0 4px 14px -6px rgba(70, 140, 220, 0.60);
+  z-index: 1;
+}
+
+/* Grid step number input in the Screen panel header. */
+.grid-step-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #5b606e;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.grid-step-input {
+  width: 54px;
+  padding: 2px 4px;
+  font: inherit;
+  font-size: 11px;
+  color: #20232c;
+  background: rgba(255, 255, 255, 0.45);
+  border: 1px solid rgba(0, 0, 0, 0.10);
+  border-radius: 4px;
+  text-align: right;
+}
+.grid-step-input:focus {
+  outline: none;
+  border-color: rgba(70, 140, 220, 0.60);
+}
+
 .link-btn {
   appearance: none;
   background: transparent;

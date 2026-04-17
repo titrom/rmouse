@@ -73,8 +73,8 @@ func toMonitorDTOs(mons []proto.Monitor) []MonitorDTO {
 // --- Config persistence --------------------------------------------------
 
 type placedClient struct {
-	Col int32 `json:"col"`
-	Row int32 `json:"row"`
+	X int32 `json:"x"`
+	Y int32 `json:"y"`
 }
 
 type persistedConfig struct {
@@ -84,11 +84,12 @@ type persistedConfig struct {
 	Placements map[string]placedClient `json:"placements,omitempty"`
 }
 
-// PlacementDTO mirrors server.Placement for the frontend.
+// PlacementDTO mirrors server.Placement for the frontend — absolute
+// world coordinates (top-left of the client's monitor bbox).
 type PlacementDTO struct {
 	Name string `json:"name"`
-	Col  int32  `json:"col"`
-	Row  int32  `json:"row"`
+	X    int32  `json:"x"`
+	Y    int32  `json:"y"`
 }
 
 func configPath() (string, error) {
@@ -115,7 +116,7 @@ func (a *App) LoadConfig() (ConfigDTO, error) {
 			dto.RelayAddr = p.RelayAddr
 			dto.Session = p.Session
 			for name, pl := range p.Placements {
-				placements[name] = server.Placement{Col: pl.Col, Row: pl.Row}
+				placements[name] = server.Placement{X: pl.X, Y: pl.Y}
 			}
 		}
 	}
@@ -167,7 +168,7 @@ func (a *App) writePersisted(cfg *ConfigDTO) error {
 	a.mu.Lock()
 	p.Placements = make(map[string]placedClient, len(a.placements))
 	for name, pl := range a.placements {
-		p.Placements[name] = placedClient{Col: pl.Col, Row: pl.Row}
+		p.Placements[name] = placedClient{X: pl.X, Y: pl.Y}
 	}
 	a.mu.Unlock()
 	raw, err := json.MarshalIndent(p, "", "  ")
@@ -313,25 +314,24 @@ func (a *App) GetPlacements() []PlacementDTO {
 	defer a.mu.Unlock()
 	out := make([]PlacementDTO, 0, len(a.placements))
 	for name, p := range a.placements {
-		out = append(out, PlacementDTO{Name: name, Col: p.Col, Row: p.Row})
+		out = append(out, PlacementDTO{Name: name, X: p.X, Y: p.Y})
 	}
 	return out
 }
 
-// SetClientPlacement moves every live client with the given name into the
-// (col,row) cell of the server-sized grid and persists the choice.
-func (a *App) SetClientPlacement(name string, col, row int32) error {
+// SetClientPlacement places every live client with the given name so its
+// monitor-bbox top-left sits at absolute virtual-desktop coordinates (x,
+// y) and persists the choice. The GUI is responsible for collision
+// avoidance and (optional) grid snapping before calling this.
+func (a *App) SetClientPlacement(name string, x, y int32) error {
 	if name == "" {
 		return errors.New("name is required")
-	}
-	if col == 0 && row == 0 {
-		return errors.New("(0,0) collides with the server")
 	}
 	a.mu.Lock()
 	r := a.router
 	a.mu.Unlock()
 	if r != nil {
-		r.SetPlacement(name, col, row)
+		r.SetPlacement(name, x, y)
 		return nil
 	}
 	// Server not running — still persist so the placement is applied on
@@ -340,7 +340,7 @@ func (a *App) SetClientPlacement(name string, col, row int32) error {
 	if a.placements == nil {
 		a.placements = map[string]server.Placement{}
 	}
-	a.placements[name] = server.Placement{Col: col, Row: row}
+	a.placements[name] = server.Placement{X: x, Y: y}
 	a.mu.Unlock()
 	return a.writePersisted(nil)
 }
@@ -363,8 +363,8 @@ func (a *App) emitEvent(ev server.Event) {
 		runtime.EventsEmit(a.ctx, "rmouse:clientPlaced", map[string]any{
 			"id":   string(e.ID),
 			"name": e.Name,
-			"col":  e.Col,
-			"row":  e.Row,
+			"x":    e.X,
+			"y":    e.Y,
 		})
 	case server.ClientConnectedEvent:
 		runtime.EventsEmit(a.ctx, "rmouse:client", map[string]any{

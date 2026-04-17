@@ -63,8 +63,8 @@ type ServerMonitorsEvent struct {
 type ClientPlacedEvent struct {
 	ID   ConnID
 	Name string
-	Col  int32
-	Row  int32
+	X    int32
+	Y    int32
 }
 
 type ClientConnectedEvent struct {
@@ -176,6 +176,29 @@ func Run(ctx context.Context, cfg Config, sink func(Event)) error {
 		sink(ServerMonitorsEvent{Monitors: serverMons})
 	}
 
+	// Watch for hotplug / resolution changes on the host. Each snapshot
+	// updates the router's server bbox (so grab/release math stays in
+	// sync with the new layout) and is re-emitted to the GUI. Runs on a
+	// separate goroutine so the listener start isn't blocked; exits when
+	// ctx is cancelled. If the platform can't push events the goroutine
+	// returns early and we just keep the initial snapshot — a periodic
+	// poll fallback would belong here but isn't wired yet.
+	if monErr == nil {
+		ch := make(chan []proto.Monitor, 4)
+		go func() {
+			_ = disp.Subscribe(ctx, ch)
+			close(ch)
+		}()
+		go func() {
+			for mons := range ch {
+				if router != nil {
+					router.UpdateServerMonitors(mons)
+				}
+				sink(ServerMonitorsEvent{Monitors: mons})
+			}
+		}()
+	}
+
 	handler := func(s *transport.Session, hello *proto.Hello) {
 		handleClient(ctx, s, hello, router, sink)
 	}
@@ -206,7 +229,7 @@ func handleClient(ctx context.Context, s *transport.Session, hello *proto.Hello,
 
 	if router != nil {
 		p := router.Register(id, name, s, hello.Monitors)
-		sink(ClientPlacedEvent{ID: id, Name: name, Col: p.Col, Row: p.Row})
+		sink(ClientPlacedEvent{ID: id, Name: name, X: p.X, Y: p.Y})
 		defer router.Unregister(id)
 	}
 

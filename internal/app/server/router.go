@@ -13,23 +13,24 @@ import (
 	"github.com/titrom/rmouse/internal/transport"
 )
 
-// Placement is a discrete cell index of a client relative to the server's
-// bounding box in the virtual desktop. (0,0) sits on top of the server and
-// is not allowed; (1,0) is flush-right, (-1,0) is flush-left, etc. Larger
-// magnitudes place the client further away in cell-sized steps.
+// Placement is the absolute virtual-desktop position of a client's
+// top-left corner (= minimum monitor X/Y across all its screens). The
+// GUI lets the user drop a client anywhere — optionally snapped to a
+// visual grid — and sends the resulting world coordinates verbatim;
+// the router applies them without any server-anchored arithmetic.
 type Placement struct {
-	Col int32
-	Row int32
+	X int32
+	Y int32
 }
 
 // Router owns the virtual-desktop cursor, decides when to "grab" (forward
 // input to a remote client) vs let events pass locally, and streams input
 // to the active client over its Session.
 //
-// Clients live in a cell grid around the server: each cell is the size of
-// the server's bounding box. Placements are keyed by client name so that
-// they survive reconnect, and are externally editable (drag-and-drop in
-// the GUI) via SetPlacement.
+// Clients live at free world coordinates chosen by the operator (drag-
+// and-drop in the GUI, optionally grid-snapped). Placements are keyed by
+// client name so they survive reconnect, and are externally editable via
+// SetPlacement.
 type Router struct {
 	mu sync.Mutex
 
@@ -79,6 +80,14 @@ type Router struct {
 	// there manually.
 	heldKeys     map[uint16]bool
 	keysOnClient map[uint16]bool
+
+	// grabSyncing is set on grab-in until the first hook event whose absX,Y
+	// arrives near the trap point — i.e., until the trap-teleport has
+	// actually taken effect and the OS event queue has flushed any stale
+	// pre-teleport events. Events received during this window are dropped
+	// (no delta applied) so their fake "cursor at old screen edge" position
+	// doesn't blow vx,vy past the client rect.
+	grabSyncing bool
 
 	active *routerClient
 
@@ -168,6 +177,49 @@ func (r *Router) ServerMonitors() []proto.Monitor {
 	return append([]proto.Monitor(nil), r.serverMons...)
 }
 
+// UpdateServerMonitors swaps in a new local monitor layout — used when
+// the OS reports a hotplug (monitor connected / disconnected / rotated /
+// resolution changed). Recomputes bbox and trap point; placements are
+// kept as-is (they're absolute world coords, independent of where the
+// server sits in the virtual desktop).
+func (r *Router) UpdateServerMonitors(mons []proto.Monitor) {
+	var minX, maxX, minY, maxY int32
+	var cx, cy int32
+	first := true
+	for _, m := range mons {
+		left := m.X
+		right := m.X + int32(m.W)
+		top := m.Y
+		bottom := m.Y + int32(m.H)
+		if first || left < minX {
+			minX = left
+		}
+		if first || right > maxX {
+			maxX = right
+		}
+		if first || top < minY {
+			minY = top
+		}
+		if first || bottom > maxY {
+			maxY = bottom
+		}
+		if m.Primary || first {
+			cx = m.X + int32(m.W)/2
+			cy = m.Y + int32(m.H)/2
+		}
+		first = false
+	}
+	r.mu.Lock()
+	r.serverMons = append(r.serverMons[:0], mons...)
+	r.serverMinX = minX
+	r.serverMaxX = maxX
+	r.serverMinY = minY
+	r.serverMaxY = maxY
+	r.trapX = cx
+	r.trapY = cy
+	r.mu.Unlock()
+}
+
 // Placements returns a snapshot of the current name→cell mapping.
 func (r *Router) Placements() map[string]Placement {
 	r.mu.Lock()
@@ -209,10 +261,11 @@ func (r *Router) UpdateMonitors(id ConnID, monitors []proto.Monitor) {
 	r.applyPlacementAt(c, monitors, p)
 }
 
-// SetPlacement moves every live client with the given name to (col,row)
-// and remembers the placement for future reconnects.
-func (r *Router) SetPlacement(name string, col, row int32) {
-	p := Placement{Col: col, Row: row}
+// SetPlacement moves every live client with the given name to absolute
+// virtual-desktop coordinates (x, y) — the top-left of its monitor bbox
+// — and remembers the placement for future reconnects.
+func (r *Router) SetPlacement(name string, x, y int32) {
+	p := Placement{X: x, Y: y}
 	r.mu.Lock()
 	r.placements[name] = p
 	for _, c := range r.clients {
@@ -228,72 +281,44 @@ func (r *Router) SetPlacement(name string, col, row int32) {
 }
 
 // ensurePlacement returns the stored placement for name, or auto-assigns
-// one (next free column to the right of the rightmost occupied cell, row 0)
-// and stores it. Caller must hold r.mu. The bool is true when a new
-// placement was allocated.
+// one (flush-right of the rightmost occupied client, same Y as the
+// server top) and stores it. Caller must hold r.mu. The bool is true
+// when a new placement was allocated.
 func (r *Router) ensurePlacement(name string) (Placement, bool) {
 	if p, ok := r.placements[name]; ok {
 		return p, false
 	}
-	maxCol := int32(0)
+	maxX := r.serverMaxX
 	for _, p := range r.placements {
-		if p.Row == 0 && p.Col > maxCol {
-			maxCol = p.Col
+		if p.X > maxX {
+			maxX = p.X
 		}
 	}
-	p := Placement{Col: maxCol + 1, Row: 0}
+	p := Placement{X: maxX, Y: r.serverMinY}
 	r.placements[name] = p
 	return p, true
 }
 
-// applyPlacementAt positions the client adjacent to the server's bounding
-// box: col=+1 puts the client's left edge flush against serverMaxX, col=-1
-// puts its right edge flush against serverMinX, col=0 aligns its left with
-// serverMinX (rows analogous). The earlier "one server-bbox per cell"
-// formula left a gap of (cellSize - clientSize) on negative cells, so the
-// push-projection landing point (serverMinY - hyst, etc.) fell into empty
-// space and clientAt missed the client. Edge-aligned placement guarantees
-// the projection lands grabHysteresis pixels inside the client's rect.
-// Must be called with r.mu held.
+// applyPlacementAt positions the client's top-left (min monitor X/Y)
+// at the placement's absolute world coordinates. Because the operator
+// drags freely — optionally against a visual grid — there is no cell
+// formula here; we just translate the client's own monitor offsets so
+// its top-left lands exactly on (p.X, p.Y). Must be called with r.mu held.
 func (r *Router) applyPlacementAt(c *routerClient, monitors []proto.Monitor, p Placement) {
 	c.monitors = append(c.monitors[:0], monitors...)
-	var cMinX, cMinY, cMaxX, cMaxY int32
+	var cMinX, cMinY int32
 	first := true
 	for _, m := range monitors {
-		l := m.X
-		rgt := m.X + int32(m.W)
-		t := m.Y
-		b := m.Y + int32(m.H)
-		if first || l < cMinX {
-			cMinX = l
+		if first || m.X < cMinX {
+			cMinX = m.X
 		}
-		if first || rgt > cMaxX {
-			cMaxX = rgt
-		}
-		if first || t < cMinY {
-			cMinY = t
-		}
-		if first || b > cMaxY {
-			cMaxY = b
+		if first || m.Y < cMinY {
+			cMinY = m.Y
 		}
 		first = false
 	}
-	switch {
-	case p.Col > 0:
-		c.offsetX = r.serverMaxX - cMinX
-	case p.Col < 0:
-		c.offsetX = r.serverMinX - cMaxX
-	default:
-		c.offsetX = r.serverMinX - cMinX
-	}
-	switch {
-	case p.Row > 0:
-		c.offsetY = r.serverMaxY - cMinY
-	case p.Row < 0:
-		c.offsetY = r.serverMinY - cMaxY
-	default:
-		c.offsetY = r.serverMinY - cMinY
-	}
+	c.offsetX = p.X - cMinX
+	c.offsetY = p.Y - cMinY
 }
 
 // Unregister removes a client from routing. If it was the grabbed client,
@@ -317,6 +342,7 @@ func (r *Router) Unregister(id ConnID) {
 			delete(r.keysOnClient, hid)
 		}
 		r.active = nil
+		r.grabSyncing = false
 		if r.ctl != nil {
 			r.ctl.SetConsume(false)
 		}
@@ -465,23 +491,49 @@ func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
 		// triggering an immediate release, then re-cross, then release —
 		// the visible "twitch in the corner" the user reported. Putting
 		// vx well inside the client's rect absorbs that jitter.
+		// Raycast to the nearest client monitor in the push direction
+		// whose perpendicular range contains the traversal coordinate, so
+		// the projection lands grabHysteresis pixels INSIDE that client —
+		// even when a gap separates it from the server edge. With free
+		// world-coord placement (see applyPlacementAt) clients can be
+		// dropped anywhere on the grid, so clients are often not flush
+		// against the server; without raycasting, the old "project exactly
+		// past the server edge" would miss and grab would never open.
+		// When no client is in range we still set vx,vy past the edge so
+		// the miss-log has meaningful coords.
 		var crossed bool
 		var crossDir string
 		switch {
 		case pushRight:
-			r.vx, r.vy = r.serverMaxX+grabHysteresis, absY
+			targetX := r.serverMaxX
+			if c, left := r.raycastClient("right", absY); c != nil {
+				targetX = left
+			}
+			r.vx, r.vy = targetX+grabHysteresis, absY
 			crossed = true
 			crossDir = "right"
 		case pushLeft:
-			r.vx, r.vy = r.serverMinX-1-grabHysteresis, absY
+			targetX := r.serverMinX
+			if c, right := r.raycastClient("left", absY); c != nil {
+				targetX = right
+			}
+			r.vx, r.vy = targetX-1-grabHysteresis, absY
 			crossed = true
 			crossDir = "left"
 		case pushBot:
-			r.vx, r.vy = absX, r.serverMaxY+grabHysteresis
+			targetY := r.serverMaxY
+			if c, top := r.raycastClient("bot", absX); c != nil {
+				targetY = top
+			}
+			r.vx, r.vy = absX, targetY+grabHysteresis
 			crossed = true
 			crossDir = "bot"
 		case pushTop:
-			r.vx, r.vy = absX, r.serverMinY-1-grabHysteresis
+			targetY := r.serverMinY
+			if c, bot := r.raycastClient("top", absX); c != nil {
+				targetY = bot
+			}
+			r.vx, r.vy = absX, targetY-1-grabHysteresis
 			crossed = true
 			crossDir = "top"
 		}
@@ -503,9 +555,20 @@ func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
 		r.resolveRegion(ctl)
 		if r.active != nil {
 			// Grab succeeded — trap the physical cursor at centre so we
-			// keep getting non-zero deltas.
+			// keep getting non-zero deltas (Windows clamps cursor at screen
+			// edges, so without trapping a user pushing further in the
+			// grabbed direction would just produce repeated absX,absY at
+			// the screen edge with zero delta).
+			//
+			// The trap teleport doesn't take effect synchronously — Windows
+			// queues the SetCursorPos behind any hook events already in
+			// flight, so the next 1–3 hook events report absX,absY from
+			// the *pre*-teleport position. We mark grabSyncing=true and
+			// drop those stale events; once a hook event arrives near the
+			// trap, we sync lastAbs and start applying deltas normally.
 			_ = r.injector.MouseMoveAbs(r.trapX, r.trapY)
 			r.lastAbsX, r.lastAbsY = r.trapX, r.trapY
+			r.grabSyncing = true
 			slog.Info("router/move grab on",
 				"client", r.active.name,
 				"v", fmt.Sprintf("(%d,%d)", r.vx, r.vy),
@@ -521,7 +584,30 @@ func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
 		return
 	}
 
-	// Grabbed mode: compute hardware delta relative to the trap point.
+	// After grab-in the trap teleport is in flight: Windows queues hook
+	// events from before the teleport landed. Their absX,Y reflect the
+	// pre-teleport (cross-edge) position, so trap-relative deltas would
+	// look like hundreds of pixels in the pushed direction, blowing the
+	// virtual cursor past the client. Drop everything until a hook event
+	// arrives near the trap point — that's our signal the queue has
+	// flushed.
+	if r.grabSyncing {
+		if absInt32(absX-r.trapX) <= grabSyncSettlePx && absInt32(absY-r.trapY) <= grabSyncSettlePx {
+			r.grabSyncing = false
+			slog.Info("router/move grab synced",
+				"client", r.active.name,
+				"abs", fmt.Sprintf("(%d,%d)", absX, absY))
+		} else {
+			slog.Info("router/move grab sync drop",
+				"client", r.active.name,
+				"abs", fmt.Sprintf("(%d,%d)", absX, absY))
+		}
+		return
+	}
+	// Grabbed: each event's delta is hardware motion since the last trap
+	// teleport. We re-trap after every event so the OS cursor stays in the
+	// middle of the primary monitor and never bumps the screen edge (which
+	// would clamp future deltas to zero).
 	dx := absX - r.trapX
 	dy := absY - r.trapY
 	if dx == 0 && dy == 0 {
@@ -529,6 +615,12 @@ func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
 	}
 	r.vx += dx
 	r.vy += dy
+	// Clamp to the active client's monitor union, except when the new
+	// position is inside the server (legitimate release path). Without this
+	// a client that's shorter or narrower than the server lets the cursor
+	// fly past a client edge that doesn't lead anywhere — clientAt returns
+	// nil and resolveRegion would release grab.
+	r.vx, r.vy = clampToActiveClient(r.vx, r.vy, r.active, r.serverMons)
 	_ = r.injector.MouseMoveAbs(r.trapX, r.trapY)
 	r.lastAbsX, r.lastAbsY = r.trapX, r.trapY
 	slog.Info("router/move grabbed",
@@ -537,6 +629,19 @@ func (r *Router) onMouseMove(absX, absY int32, ctl inputevent.Ctl) {
 		"d", fmt.Sprintf("(%+d,%+d)", dx, dy),
 		"v", fmt.Sprintf("(%d,%d)", r.vx, r.vy))
 	r.resolveRegion(ctl)
+}
+
+// grabSyncSettlePx is how close to the trap point a hook event's absX,Y
+// has to be before we consider the post-grab teleport "settled" and start
+// applying deltas. Generous because the user may have a few ms of motion
+// already accumulated against the trap by the time we see it.
+const grabSyncSettlePx int32 = 100
+
+func absInt32(v int32) int32 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 // resolveRegion decides whether the virtual cursor is on the server or
@@ -594,6 +699,7 @@ func (r *Router) resolveRegion(ctl inputevent.Ctl) {
 		}
 		_ = r.active.session.Send(&proto.Grab{On: false})
 		r.active = nil
+		r.grabSyncing = false
 		ctl.SetConsume(false)
 		// Clamp virtual cursor to server bounds so next grab re-enters cleanly.
 		r.vx, r.vy = clampToServer(r.vx, r.vy, r.serverMons)
@@ -652,6 +758,150 @@ func (r *Router) sendAbs(c *routerClient) {
 	}
 }
 
+// clampToActiveClient keeps the cursor inside the active client's monitor
+// union once grabbed, except when it has crossed back into a server monitor
+// (the legitimate release path). When neither inside the client nor inside
+// the server, the cursor is snapped to the nearest point on the client's
+// rect — turns "fall through a non-server-adjacent client edge" from a grab
+// loss into a wall hit.
+func clampToActiveClient(vx, vy int32, c *routerClient, serverMons []proto.Monitor) (int32, int32) {
+	if c == nil {
+		return vx, vy
+	}
+	for _, m := range c.monitors {
+		l := c.offsetX + m.X
+		t := c.offsetY + m.Y
+		if vx >= l && vx < l+int32(m.W) && vy >= t && vy < t+int32(m.H) {
+			return vx, vy
+		}
+	}
+	if anyServerMonContains(serverMons, vx, vy) {
+		return vx, vy
+	}
+	// Cursor is in free space (neither in the client nor in any server
+	// monitor). With gap-placed clients this is the normal "user is
+	// trying to exit the client back toward the server" situation —
+	// previously we just snapped to the nearest client edge (wall hit),
+	// which trapped the user on the client forever. Instead, if the
+	// cursor exited via the client's server-facing edge and the server
+	// bbox lies on that side, teleport across the gap to just inside
+	// the server so resolveRegion can take the release path. Done per-
+	// axis so a diagonal escape still finds the server.
+	var cL, cR, cT, cB int32
+	{
+		first := true
+		for _, m := range c.monitors {
+			l := c.offsetX + m.X
+			rgt := l + int32(m.W)
+			t := c.offsetY + m.Y
+			bot := t + int32(m.H)
+			if first || l < cL {
+				cL = l
+			}
+			if first || rgt > cR {
+				cR = rgt
+			}
+			if first || t < cT {
+				cT = t
+			}
+			if first || bot > cB {
+				cB = bot
+			}
+			first = false
+		}
+	}
+	var sL, sR, sT, sB int32
+	{
+		first := true
+		for _, m := range serverMons {
+			l := m.X
+			rgt := l + int32(m.W)
+			t := m.Y
+			bot := t + int32(m.H)
+			if first || l < sL {
+				sL = l
+			}
+			if first || rgt > sR {
+				sR = rgt
+			}
+			if first || t < sT {
+				sT = t
+			}
+			if first || bot > sB {
+				sB = bot
+			}
+			first = false
+		}
+	}
+	jumpX, jumpY := vx, vy
+	crossed := false
+	switch {
+	case vx < cL && sR <= cL:
+		jumpX = sR - 1 - grabHysteresis
+		crossed = true
+	case vx >= cR && sL >= cR:
+		jumpX = sL + grabHysteresis
+		crossed = true
+	}
+	switch {
+	case vy < cT && sB <= cT:
+		jumpY = sB - 1 - grabHysteresis
+		crossed = true
+	case vy >= cB && sT >= cB:
+		jumpY = sT + grabHysteresis
+		crossed = true
+	}
+	if crossed {
+		// Ensure the landing point sits inside the server bbox so
+		// resolveRegion sees "not in any client" and releases.
+		if jumpX < sL+grabHysteresis {
+			jumpX = sL + grabHysteresis
+		}
+		if jumpX > sR-1-grabHysteresis {
+			jumpX = sR - 1 - grabHysteresis
+		}
+		if jumpY < sT+grabHysteresis {
+			jumpY = sT + grabHysteresis
+		}
+		if jumpY > sB-1-grabHysteresis {
+			jumpY = sB - 1 - grabHysteresis
+		}
+		return jumpX, jumpY
+	}
+	// No server in the exit direction — fall back to the "wall hit"
+	// behaviour: snap to the nearest point on the client's union.
+	var bestX, bestY int32
+	var bestD int64 = -1
+	for _, m := range c.monitors {
+		l := c.offsetX + m.X
+		t := c.offsetY + m.Y
+		rgt := l + int32(m.W) - 1
+		bot := t + int32(m.H) - 1
+		cx := vx
+		switch {
+		case cx < l:
+			cx = l
+		case cx > rgt:
+			cx = rgt
+		}
+		cy := vy
+		switch {
+		case cy < t:
+			cy = t
+		case cy > bot:
+			cy = bot
+		}
+		dxp := int64(vx - cx)
+		dyp := int64(vy - cy)
+		d := dxp*dxp + dyp*dyp
+		if bestD < 0 || d < bestD {
+			bestD = d
+			bestX, bestY = cx, cy
+		}
+	}
+	return bestX, bestY
+}
+
 func (r *Router) clientAt(x, y int32) *routerClient {
 	for _, c := range r.clients {
 		for _, m := range c.monitors {
@@ -663,6 +913,83 @@ func (r *Router) clientAt(x, y int32) *routerClient {
 		}
 	}
 	return nil
+}
+
+// raycastClient returns the nearest client monitor in the given cardinal
+// direction whose perpendicular range contains the traversal coordinate,
+// along with the traversal-axis edge the ray hits first. Used on grab-in
+// to bridge gaps between the server and a client placed at arbitrary
+// world coordinates: with free placement (see applyPlacementAt) clients
+// no longer have to be flush against the server edge, so the virtual
+// cursor must jump across any gap to the client.
+//
+// dir is one of "right", "left", "bot", "top". For "right"/"left" we
+// scan along X with Y as the perpendicular traversal coord; for "bot"
+// /"top" X is perpendicular. Returns (nil, 0) when no client lies in
+// the given half-plane with overlapping perpendicular range.
+func (r *Router) raycastClient(dir string, perp int32) (*routerClient, int32) {
+	var best *routerClient
+	var bestEdge int32
+	haveBest := false
+	for _, c := range r.clients {
+		for _, m := range c.monitors {
+			left := c.offsetX + m.X
+			top := c.offsetY + m.Y
+			right := left + int32(m.W)
+			bot := top + int32(m.H)
+			switch dir {
+			case "right":
+				if left < r.serverMaxX {
+					continue
+				}
+				if perp < top || perp >= bot {
+					continue
+				}
+				if !haveBest || left < bestEdge {
+					best = c
+					bestEdge = left
+					haveBest = true
+				}
+			case "left":
+				if right > r.serverMinX {
+					continue
+				}
+				if perp < top || perp >= bot {
+					continue
+				}
+				if !haveBest || right > bestEdge {
+					best = c
+					bestEdge = right
+					haveBest = true
+				}
+			case "bot":
+				if top < r.serverMaxY {
+					continue
+				}
+				if perp < left || perp >= right {
+					continue
+				}
+				if !haveBest || top < bestEdge {
+					best = c
+					bestEdge = top
+					haveBest = true
+				}
+			case "top":
+				if bot > r.serverMinY {
+					continue
+				}
+				if perp < left || perp >= right {
+					continue
+				}
+				if !haveBest || bot > bestEdge {
+					best = c
+					bestEdge = bot
+					haveBest = true
+				}
+			}
+		}
+	}
+	return best, bestEdge
 }
 
 // grabHysteresis is the pixel buffer applied on grab transitions. On cross-in
