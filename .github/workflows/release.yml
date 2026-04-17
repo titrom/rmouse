@@ -1,0 +1,147 @@
+name: release
+
+# Triggered by pushing a tag like v1.0.0. Also runnable manually from the
+# Actions tab (workflow_dispatch) for dry runs.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create a GitHub Release and upload assets
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Windows — full build: CLI binaries + Wails GUI (client + server).
+  # ---------------------------------------------------------------------------
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Build CLI binaries
+        shell: bash
+        run: |
+          mkdir -p dist/windows-amd64
+          for cmd in mouse-remote-client mouse-remote-server mouse-remote-relay; do
+            GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+              go build -ldflags="-s -w" \
+              -o "dist/windows-amd64/$cmd.exe" \
+              "./cmd/$cmd"
+          done
+
+      - name: Build GUI binaries (Wails)
+        shell: bash
+        run: |
+          for gui in mouse-remote-client-gui mouse-remote-server-gui; do
+            (cd "cmd/$gui" && wails build -clean -platform windows/amd64)
+            cp "cmd/$gui/build/bin/$gui.exe" "dist/windows-amd64/$gui.exe"
+          done
+
+      - name: Package
+        shell: bash
+        run: |
+          cd dist
+          7z a rmouse-windows-amd64.zip windows-amd64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rmouse-windows-amd64
+          path: dist/rmouse-windows-amd64.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux — CLI binaries always, GUI left as a placeholder for you to enable.
+  #
+  # Wails Linux builds need host-side GTK3 + WebKit2GTK (see the comment in the
+  # GUI step below). CLI builds cross-compile from any host and need nothing.
+  # ---------------------------------------------------------------------------
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: true
+
+      - name: Build CLI binaries
+        run: |
+          mkdir -p dist/linux-amd64
+          for cmd in mouse-remote-client mouse-remote-server mouse-remote-relay; do
+            GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+              go build -ldflags="-s -w" \
+              -o "dist/linux-amd64/$cmd" \
+              "./cmd/$cmd"
+          done
+
+      # TODO(you): enable GUI builds on Linux. Uncomment and adapt the two
+      # steps below — they mirror the Windows GUI step. Wails on Linux
+      # requires GTK3 + WebKit2GTK dev headers on the build host.
+      #
+      # - name: Install Wails Linux deps
+      #   run: |
+      #     sudo apt-get update
+      #     sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
+      #
+      # - uses: actions/setup-node@v4
+      #   with:
+      #     node-version: "20"
+      #
+      # - name: Install Wails CLI
+      #   run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+      #
+      # - name: Build GUI binaries (Wails)
+      #   run: |
+      #     for gui in mouse-remote-client-gui mouse-remote-server-gui; do
+      #       (cd "cmd/$gui" && wails build -clean -platform linux/amd64)
+      #       cp "cmd/$gui/build/bin/$gui" "dist/linux-amd64/$gui"
+      #     done
+
+      - name: Package
+        run: |
+          cd dist
+          tar -czf rmouse-linux-amd64.tar.gz linux-amd64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rmouse-linux-amd64
+          path: dist/rmouse-linux-amd64.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Collect artifacts from the per-OS jobs and publish one GitHub Release.
+  # Only runs on tag pushes — manual dispatch uploads artifacts but doesn't
+  # create a Release.
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [windows, linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/rmouse-windows-amd64/rmouse-windows-amd64.zip
+            artifacts/rmouse-linux-amd64/rmouse-linux-amd64.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false
