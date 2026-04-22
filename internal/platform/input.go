@@ -55,3 +55,16 @@ type Capturer interface {
 	// The capturer stops and closes the event channel when ctx is cancelled.
 	Capture(ctx context.Context) (<-chan inputevent.Event, inputevent.Ctl, error)
 }
+
+// Clipboard watches and applies local OS clipboard state.
+type Clipboard interface {
+	// Read returns the current clipboard payload. ok=false means clipboard does
+	// not currently contain a supported format.
+	Read() (format proto.ClipboardFormat, data []byte, ok bool, err error)
+	// Write replaces clipboard contents with one normalized payload.
+	Write(format proto.ClipboardFormat, data []byte) error
+	// Watch calls sink whenever clipboard payload changes to a supported format.
+	Watch(ctx context.Context, sink func(format proto.ClipboardFormat, data []byte)) error
+	// Close releases resources. Safe to call multiple times.
+	Close() error
+}

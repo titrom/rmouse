@@ -29,6 +29,12 @@ func TestRoundTrip(t *testing.T) {
 		&Pong{Seq: 42},
 		&Grab{On: true},
 		&Bye{Reason: "shutdown"},
+		&ClipboardUpdate{
+			OriginID: "server-1",
+			Seq:      77,
+			Format:   ClipboardFormatFilesList,
+			Data:     []byte(`["C:\\tmp\\a.txt","C:\\tmp\\b.png"]`),
+		},
 	}
 	for _, want := range cases {
 		var buf bytes.Buffer
@@ -82,6 +88,23 @@ func TestWriteTooLarge(t *testing.T) {
 	// here we just verify Read rejects an oversize length header.
 	buf.Write([]byte{0, 0, 0x20, 0}) // length = 0x00200000 = 2 MiB > MaxFrameSize
 	if _, err := Read(&buf); err == nil {
+		t.Fatal("expected frame-too-large error")
+	}
+}
+
+func TestClipboardWriteTooLarge(t *testing.T) {
+	huge := make([]byte, MaxFrameSize)
+	for i := range huge {
+		huge[i] = byte(i)
+	}
+	var buf bytes.Buffer
+	err := Write(&buf, &ClipboardUpdate{
+		OriginID: "client-1",
+		Seq:      1,
+		Format:   ClipboardFormatImagePNG,
+		Data:     huge,
+	})
+	if err == nil {
 		t.Fatal("expected frame-too-large error")
 	}
 }

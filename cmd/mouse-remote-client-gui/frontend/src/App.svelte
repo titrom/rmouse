@@ -15,6 +15,7 @@
   let pingMs = 2000;
   let relayAddr = "";
   let session = "";
+  let clipboard = false;
 
   let running = false;
   let busy = false;
@@ -99,6 +100,7 @@
     pingMs = cfg.pingMs || 2000;
     relayAddr = cfg.relayAddr || "";
     session = cfg.session || "";
+    clipboard = !!cfg.clipboard;
     running = await IsRunning();
     state = running ? "connecting" : "idle";
     try { monitors = await EnumerateMonitors(); } catch { monitors = []; }
@@ -133,7 +135,7 @@
     running = true;
     busy = true;
     try {
-      const cfg = new main.ConfigDTO({ addr, token, name, pingMs, relayAddr, session });
+      const cfg = new main.ConfigDTO({ addr, token, name, pingMs, relayAddr, session, clipboard });
       await SaveConfig(cfg);
       await Start(cfg);
       const r = await IsRunning();
@@ -193,6 +195,7 @@
     hasInputPerm = false;
   }
   function onGrab(p: any) { grabbing = !!p?.on; log("info", `grab ${p?.on ? "on" : "off"}`); }
+  function onClipboardUnavailable(p: any) { log("warn", `clipboard unavailable: ${p?.err ?? ""}`); }
   function onStopped() {
     running = false;
     state = "idle";
@@ -217,6 +220,7 @@
     EventsOn("rmouse:hotplugUnavailable", onHotplugUnavailable);
     EventsOn("rmouse:injectorUnavailable", onInjectorUnavailable);
     EventsOn("rmouse:grab", onGrab);
+    EventsOn("rmouse:clipboardUnavailable", onClipboardUnavailable);
     EventsOn("rmouse:stopped", onStopped);
     EventsOn("rmouse:fatal", onFatal);
     if (stage) {
@@ -233,6 +237,7 @@
     EventsOff("rmouse:hotplugUnavailable");
     EventsOff("rmouse:injectorUnavailable");
     EventsOff("rmouse:grab");
+    EventsOff("rmouse:clipboardUnavailable");
     EventsOff("rmouse:stopped");
     EventsOff("rmouse:fatal");
     stageObserver?.disconnect();
@@ -319,6 +324,10 @@
         <div class="field">
           <label for="session">Session</label>
           <input id="session" type="text" bind:value={session} placeholder="(required with relay)" disabled={running} />
+        </div>
+        <div class="field check">
+          <label for="clipboard">Clipboard sync</label>
+          <input id="clipboard" type="checkbox" bind:checked={clipboard} disabled={running} />
         </div>
       </section>
     {/if}

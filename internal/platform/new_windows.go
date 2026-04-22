@@ -12,3 +12,6 @@ func NewInjector() (Injector, error) { return windows.NewInjector() }
 
 // NewCapturer returns the OS-specific input capturer for the current platform.
 func NewCapturer() Capturer { return windows.NewCapturer() }
+
+// NewClipboard returns the OS-specific clipboard integration.
+func NewClipboard() (Clipboard, error) { return windows.NewClipboard() }

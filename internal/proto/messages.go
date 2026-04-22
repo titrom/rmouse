@@ -4,7 +4,7 @@ package proto
 
 import "fmt"
 
-const ProtoVersion uint16 = 2
+const ProtoVersion uint16 = 3
 
 type MsgType uint8
 
@@ -21,7 +21,12 @@ const (
 	TypeGrab            MsgType = 10
 	TypeBye             MsgType = 11
 	TypeMonitorsChanged MsgType = 12
+	TypeClipboardUpdate MsgType = 13
 )
+
+// MaxClipboardData caps ClipboardUpdate.Data payload size.
+// It stays below MaxFrameSize to reserve room for metadata fields.
+const MaxClipboardData = (16 << 20) - 256
 
 // MaxMonitors bounds the number of monitors a peer may announce in Hello or
 // MonitorsChanged. Keeps wire framing deterministic and rejects garbage.
@@ -87,11 +92,11 @@ func decodeMonitors(d *decoder) []Monitor {
 type MouseButton uint8
 
 const (
-	BtnLeft    MouseButton = 1
-	BtnRight   MouseButton = 2
-	BtnMiddle  MouseButton = 3
-	BtnX1      MouseButton = 4
-	BtnX2      MouseButton = 5
+	BtnLeft   MouseButton = 1
+	BtnRight  MouseButton = 2
+	BtnMiddle MouseButton = 3
+	BtnX1     MouseButton = 4
+	BtnX2     MouseButton = 5
 )
 
 type Message interface {
@@ -234,11 +239,46 @@ func (m *KeyEvent) decode(d *decoder) error {
 	return d.err
 }
 
+type ClipboardFormat uint8
+
+const (
+	ClipboardFormatTextPlain ClipboardFormat = 1
+	ClipboardFormatImagePNG  ClipboardFormat = 2
+	ClipboardFormatFilesList ClipboardFormat = 3
+)
+
+// ClipboardUpdate replicates one clipboard snapshot from a peer.
+// Data format depends on Format:
+// - ClipboardFormatTextPlain: UTF-8 text bytes.
+// - ClipboardFormatImagePNG: PNG payload.
+// - ClipboardFormatFilesList: UTF-8 JSON array of absolute file paths.
+type ClipboardUpdate struct {
+	OriginID string
+	Seq      uint64
+	Format   ClipboardFormat
+	Data     []byte
+}
+
+func (*ClipboardUpdate) Type() MsgType { return TypeClipboardUpdate }
+func (m *ClipboardUpdate) encode(e *encoder) {
+	e.str(m.OriginID)
+	e.u64(m.Seq)
+	e.u8(uint8(m.Format))
+	e.bytes(m.Data)
+}
+func (m *ClipboardUpdate) decode(d *decoder) error {
+	m.OriginID = d.str()
+	m.Seq = d.u64()
+	m.Format = ClipboardFormat(d.u8())
+	m.Data = d.bytes()
+	return d.err
+}
+
 // Ping / Pong — heartbeat.
 type Ping struct{ Seq uint32 }
 
-func (*Ping) Type() MsgType          { return TypePing }
-func (m *Ping) encode(e *encoder)    { e.u32(m.Seq) }
+func (*Ping) Type() MsgType       { return TypePing }
+func (m *Ping) encode(e *encoder) { e.u32(m.Seq) }
 func (m *Ping) decode(d *decoder) error {
 	m.Seq = d.u32()
 	return d.err
@@ -246,8 +286,8 @@ func (m *Ping) decode(d *decoder) error {
 
 type Pong struct{ Seq uint32 }
 
-func (*Pong) Type() MsgType          { return TypePong }
-func (m *Pong) encode(e *encoder)    { e.u32(m.Seq) }
+func (*Pong) Type() MsgType       { return TypePong }
+func (m *Pong) encode(e *encoder) { e.u32(m.Seq) }
 func (m *Pong) decode(d *decoder) error {
 	m.Seq = d.u32()
 	return d.err
@@ -256,8 +296,8 @@ func (m *Pong) decode(d *decoder) error {
 // Grab — server tells a client that it currently owns the cursor.
 type Grab struct{ On bool }
 
-func (*Grab) Type() MsgType          { return TypeGrab }
-func (m *Grab) encode(e *encoder)    { e.bool(m.On) }
+func (*Grab) Type() MsgType       { return TypeGrab }
+func (m *Grab) encode(e *encoder) { e.bool(m.On) }
 func (m *Grab) decode(d *decoder) error {
 	m.On = d.bool()
 	return d.err
@@ -266,8 +306,8 @@ func (m *Grab) decode(d *decoder) error {
 // Bye — graceful shutdown notice with human-readable reason.
 type Bye struct{ Reason string }
 
-func (*Bye) Type() MsgType          { return TypeBye }
-func (m *Bye) encode(e *encoder)    { e.str(m.Reason) }
+func (*Bye) Type() MsgType       { return TypeBye }
+func (m *Bye) encode(e *encoder) { e.str(m.Reason) }
 func (m *Bye) decode(d *decoder) error {
 	m.Reason = d.str()
 	return d.err
@@ -279,8 +319,8 @@ type MonitorsChanged struct {
 	Monitors []Monitor
 }
 
-func (*MonitorsChanged) Type() MsgType           { return TypeMonitorsChanged }
-func (m *MonitorsChanged) encode(e *encoder)     { encodeMonitors(e, m.Monitors) }
+func (*MonitorsChanged) Type() MsgType       { return TypeMonitorsChanged }
+func (m *MonitorsChanged) encode(e *encoder) { encodeMonitors(e, m.Monitors) }
 func (m *MonitorsChanged) decode(d *decoder) error {
 	m.Monitors = decodeMonitors(d)
 	return d.err
@@ -313,6 +353,8 @@ func newByType(t MsgType) Message {
 		return &Bye{}
 	case TypeMonitorsChanged:
 		return &MonitorsChanged{}
+	case TypeClipboardUpdate:
+		return &ClipboardUpdate{}
 	}
 	return nil
 }

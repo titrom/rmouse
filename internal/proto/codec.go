@@ -8,7 +8,9 @@ import (
 )
 
 // MaxFrameSize caps a single decoded frame to guard against malformed input.
-const MaxFrameSize = 1 << 20 // 1 MiB
+// Clipboard sync may carry PNG payloads, so this limit is intentionally larger
+// than input-only frames.
+const MaxFrameSize = 16 << 20 // 16 MiB
 
 var ErrUnknownType = errors.New("proto: unknown message type")
 
@@ -71,7 +73,7 @@ type encoder struct {
 
 func newEncoder() *encoder { return &encoder{buf: make([]byte, 0, 64)} }
 
-func (e *encoder) u8(v uint8)  { e.buf = append(e.buf, v) }
+func (e *encoder) u8(v uint8) { e.buf = append(e.buf, v) }
 func (e *encoder) bool(v bool) {
 	if v {
 		e.buf = append(e.buf, 1)
@@ -93,6 +95,15 @@ func (e *encoder) u32(v uint32) {
 	e.buf = append(e.buf, b[:]...)
 }
 func (e *encoder) i32(v int32) { e.u32(uint32(v)) }
+func (e *encoder) u64(v uint64) {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], v)
+	e.buf = append(e.buf, b[:]...)
+}
+func (e *encoder) bytes(v []byte) {
+	e.u32(uint32(len(v)))
+	e.buf = append(e.buf, v...)
+}
 
 func (e *encoder) str(s string) {
 	if len(s) > 0xFFFF {
@@ -150,6 +161,27 @@ func (d *decoder) u32() uint32 {
 	return v
 }
 func (d *decoder) i32() int32 { return int32(d.u32()) }
+func (d *decoder) u64() uint64 {
+	if !d.need(8) {
+		return 0
+	}
+	v := binary.LittleEndian.Uint64(d.buf[d.pos:])
+	d.pos += 8
+	return v
+}
+func (d *decoder) bytes() []byte {
+	n := int(d.u32())
+	if n > MaxFrameSize {
+		d.err = fmt.Errorf("proto: byte slice too large: %d", n)
+		return nil
+	}
+	if !d.need(n) {
+		return nil
+	}
+	out := append([]byte(nil), d.buf[d.pos:d.pos+n]...)
+	d.pos += n
+	return out
+}
 
 func (d *decoder) str() string {
 	n := int(d.u16())

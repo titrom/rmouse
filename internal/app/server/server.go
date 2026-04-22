@@ -6,9 +6,11 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/titrom/rmouse/internal/platform"
@@ -35,6 +37,7 @@ type Config struct {
 	// OnPlacementChanged, if non-nil, is invoked whenever a client's
 	// placement is created or modified. Mirrored into the router.
 	OnPlacementChanged func(name string, p Placement)
+	EnableClipboard    bool
 }
 
 // Event is a sum type of things Run reports.
@@ -102,15 +105,20 @@ type ByeEvent struct {
 	Reason     string
 }
 
-func (ListeningEvent) isEvent()          {}
-func (ServingViaRelayEvent) isEvent()    {}
-func (ServerMonitorsEvent) isEvent()     {}
-func (ClientConnectedEvent) isEvent()    {}
-func (ClientPlacedEvent) isEvent()       {}
-func (MonitorsChangedEvent) isEvent()    {}
-func (ClientDisconnectedEvent) isEvent() {}
-func (RecvErrorEvent) isEvent()          {}
-func (ByeEvent) isEvent()                {}
+type ClipboardUnavailableEvent struct {
+	Err error
+}
+
+func (ListeningEvent) isEvent()            {}
+func (ServingViaRelayEvent) isEvent()      {}
+func (ServerMonitorsEvent) isEvent()       {}
+func (ClientConnectedEvent) isEvent()      {}
+func (ClientPlacedEvent) isEvent()         {}
+func (MonitorsChangedEvent) isEvent()      {}
+func (ClientDisconnectedEvent) isEvent()   {}
+func (RecvErrorEvent) isEvent()            {}
+func (ByeEvent) isEvent()                  {}
+func (ClipboardUnavailableEvent) isEvent() {}
 
 // CertPaths returns the on-disk paths used for the server's self-signed cert.
 // GUI callers use this to surface a fingerprint without calling Run.
@@ -199,8 +207,25 @@ func Run(ctx context.Context, cfg Config, sink func(Event)) error {
 		}()
 	}
 
+	var (
+		clipboard platform.Clipboard
+		hub       *clipboardHub
+	)
+	if cfg.EnableClipboard {
+		cb, cbErr := platform.NewClipboard()
+		if cbErr != nil {
+			sink(ClipboardUnavailableEvent{Err: cbErr})
+		} else {
+			clipboard = cb
+			defer func() { _ = clipboard.Close() }()
+		}
+	}
+	hub = newClipboardHub(clipboard)
+	if hub != nil {
+		go hub.watchLocal(ctx)
+	}
 	handler := func(s *transport.Session, hello *proto.Hello) {
-		handleClient(ctx, s, hello, router, sink)
+		handleClient(ctx, s, hello, router, hub, sink)
 	}
 
 	if cfg.RelayAddr != "" {
@@ -217,7 +242,7 @@ func newConnID() ConnID {
 	return ConnID(hex.EncodeToString(b[:]))
 }
 
-func handleClient(ctx context.Context, s *transport.Session, hello *proto.Hello, router *Router, sink func(Event)) {
+func handleClient(ctx context.Context, s *transport.Session, hello *proto.Hello, router *Router, hub *clipboardHub, sink func(Event)) {
 	id := newConnID()
 	remote := s.RemoteAddr().String()
 	name := hello.ClientName
@@ -231,6 +256,10 @@ func handleClient(ctx context.Context, s *transport.Session, hello *proto.Hello,
 		p := router.Register(id, name, s, hello.Monitors)
 		sink(ClientPlacedEvent{ID: id, Name: name, X: p.X, Y: p.Y})
 		defer router.Unregister(id)
+	}
+	if hub != nil {
+		hub.add(id, s)
+		defer hub.remove(id)
 	}
 
 	for {
@@ -265,6 +294,117 @@ func handleClient(ctx context.Context, s *transport.Session, hello *proto.Hello,
 			sink(ByeEvent{ID: id, RemoteAddr: remote, Name: name, Reason: m.Reason})
 			sink(ClientDisconnectedEvent{ID: id, RemoteAddr: remote, Name: name})
 			return
+		case *proto.ClipboardUpdate:
+			if hub != nil && validClipboardPayload(m.Format, m.Data) {
+				hub.applyRemote(m.Format, m.Data)
+				hub.broadcast(id, m)
+			}
 		}
+	}
+}
+
+type clipboardHub struct {
+	clipboard platform.Clipboard
+
+	mu       sync.Mutex
+	sessions map[ConnID]*transport.Session
+	lastHash [32]byte
+	haveHash bool
+}
+
+func newClipboardHub(clipboard platform.Clipboard) *clipboardHub {
+	if clipboard == nil {
+		return nil
+	}
+	return &clipboardHub{
+		clipboard: clipboard,
+		sessions:  map[ConnID]*transport.Session{},
+	}
+}
+
+func (h *clipboardHub) add(id ConnID, s *transport.Session) {
+	h.mu.Lock()
+	h.sessions[id] = s
+	h.mu.Unlock()
+}
+
+func (h *clipboardHub) remove(id ConnID) {
+	h.mu.Lock()
+	delete(h.sessions, id)
+	h.mu.Unlock()
+}
+
+func (h *clipboardHub) broadcast(skip ConnID, msg *proto.ClipboardUpdate) {
+	h.mu.Lock()
+	peers := make([]*transport.Session, 0, len(h.sessions))
+	for id, s := range h.sessions {
+		if id == skip {
+			continue
+		}
+		peers = append(peers, s)
+	}
+	h.mu.Unlock()
+	for _, peer := range peers {
+		_ = peer.Send(msg)
+	}
+}
+
+func (h *clipboardHub) applyRemote(format proto.ClipboardFormat, data []byte) {
+	if !validClipboardPayload(format, data) {
+		return
+	}
+	if err := h.clipboard.Write(format, data); err != nil {
+		return
+	}
+	h.setLastHash(clipboardHash(format, data))
+}
+
+func (h *clipboardHub) watchLocal(ctx context.Context) {
+	_ = h.clipboard.Watch(ctx, func(format proto.ClipboardFormat, data []byte) {
+		if !validClipboardPayload(format, data) {
+			return
+		}
+		hash := clipboardHash(format, data)
+		if h.isDuplicate(hash) {
+			return
+		}
+		msg := &proto.ClipboardUpdate{
+			OriginID: "server",
+			Seq:      uint64(time.Now().UnixNano()),
+			Format:   format,
+			Data:     append([]byte(nil), data...),
+		}
+		h.broadcast("", msg)
+		h.setLastHash(hash)
+	})
+}
+
+func (h *clipboardHub) isDuplicate(hash [32]byte) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.haveHash && h.lastHash == hash
+}
+
+func (h *clipboardHub) setLastHash(hash [32]byte) {
+	h.mu.Lock()
+	h.lastHash = hash
+	h.haveHash = true
+	h.mu.Unlock()
+}
+
+func clipboardHash(format proto.ClipboardFormat, data []byte) [32]byte {
+	sum := sha256.Sum256(append([]byte{byte(format)}, data...))
+	return sum
+}
+
+func validClipboardPayload(format proto.ClipboardFormat, data []byte) bool {
+	if len(data) == 0 || len(data) > proto.MaxClipboardData {
+		return false
+	}
+	switch format {
+	case proto.ClipboardFormatTextPlain, proto.ClipboardFormatImagePNG, proto.ClipboardFormatFilesList:
+		return true
+	default:
+		return false
 	}
 }

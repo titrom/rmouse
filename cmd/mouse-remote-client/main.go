@@ -22,6 +22,7 @@ func main() {
 	interval := flag.Duration("ping", 2*time.Second, "ping interval")
 	relayAddr := flag.String("relay", "", "relay host:port; when set, client dials the relay instead of the server directly")
 	session := flag.String("session", "", "relay session id (required with --relay)")
+	clipboard := flag.Bool("clipboard", false, "enable shared clipboard sync (Windows only)")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -47,12 +48,13 @@ func main() {
 	defer cancel()
 
 	cfg := client.Config{
-		Addr:         *addr,
-		Token:        *token,
-		Name:         *name,
-		PingInterval: *interval,
-		RelayAddr:    *relayAddr,
-		Session:      *session,
+		Addr:            *addr,
+		Token:           *token,
+		Name:            *name,
+		PingInterval:    *interval,
+		RelayAddr:       *relayAddr,
+		Session:         *session,
+		EnableClipboard: *clipboard,
 	}
 
 	if err := client.Run(ctx, cfg, logEvent); err != nil && err != context.Canceled {
@@ -91,5 +93,7 @@ func logEvent(ev client.Event) {
 		slog.Warn("input injection unavailable; received input will be dropped", "err", e.Err)
 	case client.GrabEvent:
 		slog.Info("grab", "on", e.On)
+	case client.ClipboardUnavailableEvent:
+		slog.Warn("clipboard sync unavailable", "err", e.Err)
 	}
 }

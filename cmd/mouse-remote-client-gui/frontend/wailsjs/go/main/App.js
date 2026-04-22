@@ -10,16 +10,16 @@ export function HasInputPermission() {
   return window['go']['main']['App']['HasInputPermission']();
 }
 
-export function RequestInputPermission() {
-  return window['go']['main']['App']['RequestInputPermission']();
-}
-
 export function IsRunning() {
   return window['go']['main']['App']['IsRunning']();
 }
 
 export function LoadConfig() {
   return window['go']['main']['App']['LoadConfig']();
+}
+
+export function RequestInputPermission() {
+  return window['go']['main']['App']['RequestInputPermission']();
 }
 
 export function SaveConfig(arg1) {

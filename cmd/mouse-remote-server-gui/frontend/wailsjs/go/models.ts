@@ -5,6 +5,7 @@ export namespace main {
 	    token: string;
 	    relayAddr: string;
 	    session: string;
+	    clipboard: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new ConfigDTO(source);
@@ -16,6 +17,7 @@ export namespace main {
 	        this.token = source["token"];
 	        this.relayAddr = source["relayAddr"];
 	        this.session = source["session"];
+	        this.clipboard = source["clipboard"];
 	    }
 	}
 	export class MonitorDTO {

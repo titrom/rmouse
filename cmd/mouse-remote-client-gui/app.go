@@ -47,6 +47,7 @@ type ConfigDTO struct {
 	PingMs    int    `json:"pingMs"`
 	RelayAddr string `json:"relayAddr"`
 	Session   string `json:"session"`
+	Clipboard bool   `json:"clipboard"`
 }
 
 type MonitorDTO struct {
@@ -75,6 +76,7 @@ type persistedConfig struct {
 	PingMs    int    `json:"pingMs"`
 	RelayAddr string `json:"relayAddr"`
 	Session   string `json:"session"`
+	Clipboard bool   `json:"clipboard"`
 }
 
 func configPath() (string, error) {
@@ -105,6 +107,7 @@ func (a *App) LoadConfig() (ConfigDTO, error) {
 			}
 			dto.RelayAddr = p.RelayAddr
 			dto.Session = p.Session
+			dto.Clipboard = p.Clipboard
 		}
 	}
 	if tok, err := keyring.Get(keyringService, keyringUser); err == nil {
@@ -130,6 +133,7 @@ func (a *App) SaveConfig(cfg ConfigDTO) error {
 		PingMs:    cfg.PingMs,
 		RelayAddr: cfg.RelayAddr,
 		Session:   cfg.Session,
+		Clipboard: cfg.Clipboard,
 	}
 	raw, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
@@ -192,12 +196,13 @@ func (a *App) Start(cfg ConfigDTO) error {
 	go func() {
 		defer close(done)
 		cc := client.Config{
-			Addr:         cfg.Addr,
-			Token:        cfg.Token,
-			Name:         cfg.Name,
-			PingInterval: time.Duration(cfg.PingMs) * time.Millisecond,
-			RelayAddr:    cfg.RelayAddr,
-			Session:      cfg.Session,
+			Addr:            cfg.Addr,
+			Token:           cfg.Token,
+			Name:            cfg.Name,
+			PingInterval:    time.Duration(cfg.PingMs) * time.Millisecond,
+			RelayAddr:       cfg.RelayAddr,
+			Session:         cfg.Session,
+			EnableClipboard: cfg.Clipboard,
 		}
 		err := client.Run(ctx, cc, func(ev client.Event) {
 			a.emitEvent(ev)
@@ -279,5 +284,11 @@ func (a *App) emitEvent(ev client.Event) {
 		runtime.EventsEmit(a.ctx, "rmouse:injectorUnavailable", map[string]any{"err": msg})
 	case client.GrabEvent:
 		runtime.EventsEmit(a.ctx, "rmouse:grab", map[string]any{"on": e.On})
+	case client.ClipboardUnavailableEvent:
+		msg := ""
+		if e.Err != nil {
+			msg = e.Err.Error()
+		}
+		runtime.EventsEmit(a.ctx, "rmouse:clipboardUnavailable", map[string]any{"err": msg})
 	}
 }

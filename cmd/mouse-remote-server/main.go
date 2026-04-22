@@ -18,6 +18,7 @@ func main() {
 	token := flag.String("token", "", "shared pairing token (required)")
 	relayAddr := flag.String("relay", "", "relay host:port; when set, server dials the relay instead of listening locally")
 	session := flag.String("session", "", "relay session id (required with --relay)")
+	clipboard := flag.Bool("clipboard", false, "enable shared clipboard sync (Windows only)")
 	flag.Parse()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -36,10 +37,11 @@ func main() {
 	defer cancel()
 
 	cfg := server.Config{
-		Addr:      *addr,
-		Token:     *token,
-		RelayAddr: *relayAddr,
-		Session:   *session,
+		Addr:            *addr,
+		Token:           *token,
+		RelayAddr:       *relayAddr,
+		Session:         *session,
+		EnableClipboard: *clipboard,
 	}
 
 	if err := server.Run(ctx, cfg, logEvent); err != nil && !errors.Is(err, context.Canceled) {
@@ -72,5 +74,7 @@ func logEvent(ev server.Event) {
 		slog.With("remote", e.RemoteAddr, "client", e.Name).Info("bye", "reason", e.Reason)
 	case server.ClientDisconnectedEvent:
 		slog.With("remote", e.RemoteAddr, "client", e.Name).Info("client disconnected")
+	case server.ClipboardUnavailableEvent:
+		slog.Warn("clipboard sync unavailable", "err", e.Err)
 	}
 }

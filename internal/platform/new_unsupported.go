@@ -35,3 +35,8 @@ func (unsupportedCapturer) Capture(context.Context) (<-chan inputevent.Event, in
 
 // NewCapturer returns a stub capturer for unsupported platforms.
 func NewCapturer() Capturer { return unsupportedCapturer{} }
+
+// NewClipboard returns a stub error for unsupported platforms.
+func NewClipboard() (Clipboard, error) {
+	return nil, errors.New("platform: clipboard not implemented on this OS")
+}

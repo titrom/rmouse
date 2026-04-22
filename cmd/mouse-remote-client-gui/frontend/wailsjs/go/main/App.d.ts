@@ -6,11 +6,11 @@ export function EnumerateMonitors():Promise<Array<main.MonitorDTO>>;
 
 export function HasInputPermission():Promise<boolean>;
 
-export function RequestInputPermission():Promise<void>;
-
 export function IsRunning():Promise<boolean>;
 
 export function LoadConfig():Promise<main.ConfigDTO>;
+
+export function RequestInputPermission():Promise<void>;
 
 export function SaveConfig(arg1:main.ConfigDTO):Promise<void>;
 

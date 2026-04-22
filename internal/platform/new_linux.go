@@ -12,3 +12,6 @@ func NewInjector() (Injector, error) { return linux.NewInjector() }
 
 // NewCapturer returns the OS-specific input capturer for the current platform.
 func NewCapturer() Capturer { return linux.NewCapturer() }
+
+// NewClipboard returns Linux clipboard integration when implemented.
+func NewClipboard() (Clipboard, error) { return linux.NewClipboard() }

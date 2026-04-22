@@ -11,6 +11,7 @@
   let token = "";
   let relayAddr = "";
   let session = "";
+  let clipboard = false;
   let fingerprint = "";
   let running = false;
   let busy = false;
@@ -591,6 +592,7 @@
     token = cfg.token || "";
     relayAddr = cfg.relayAddr || "";
     session = cfg.session || "";
+    clipboard = !!cfg.clipboard;
     running = await IsRunning();
     status = running ? "running" : "stopped";
     try { fingerprint = await CertFingerprint(); } catch (e) { /* cert lazy */ }
@@ -609,8 +611,8 @@
     running = true;
     busy = true;
     try {
-      await SaveConfig(new main.ConfigDTO({ addr, token, relayAddr, session }));
-      await Start(new main.ConfigDTO({ addr, token, relayAddr, session }));
+      await SaveConfig(new main.ConfigDTO({ addr, token, relayAddr, session, clipboard }));
+      await Start(new main.ConfigDTO({ addr, token, relayAddr, session, clipboard }));
       // Reconcile against ground truth in case Go failed silently between
       // the optimistic flip above and now.
       const r = await IsRunning();
@@ -707,6 +709,7 @@
     bumpClients();
   }
   function onRecvErr(p: any) { log("warn", `recv ${p?.name ?? p?.id}: ${p?.err}`); }
+  function onClipboardUnavailable(p: any) { log("warn", `clipboard unavailable: ${p?.err ?? ""}`); }
 
   let stageObserver: ResizeObserver | null = null;
   onMount(() => {
@@ -720,6 +723,7 @@
     EventsOn("rmouse:clientPlaced", onPlaced);
     EventsOn("rmouse:recvError", onRecvErr);
     EventsOn("rmouse:serverMonitors", onMonitorsEvent);
+    EventsOn("rmouse:clipboardUnavailable", onClipboardUnavailable);
     if (stage) {
       stageObserver = new ResizeObserver(() => {
         stageW = stage.clientWidth;
@@ -736,6 +740,7 @@
     EventsOff("rmouse:clientPlaced");
     EventsOff("rmouse:recvError");
     EventsOff("rmouse:serverMonitors");
+    EventsOff("rmouse:clipboardUnavailable");
     stageObserver?.disconnect();
   });
 </script>
@@ -774,6 +779,10 @@
       <div class="field">
         <label for="session">Session</label>
         <input id="session" type="text" bind:value={session} placeholder="session id" disabled={running} />
+      </div>
+      <div class="field check">
+        <label for="clipboard">Clipboard sync</label>
+        <input id="clipboard" type="checkbox" bind:checked={clipboard} disabled={running} />
       </div>
     </details>
 

@@ -50,6 +50,7 @@ type ConfigDTO struct {
 	Token     string `json:"token"`
 	RelayAddr string `json:"relayAddr"`
 	Session   string `json:"session"`
+	Clipboard bool   `json:"clipboard"`
 }
 
 type MonitorDTO struct {
@@ -81,6 +82,7 @@ type persistedConfig struct {
 	Addr       string                  `json:"addr"`
 	RelayAddr  string                  `json:"relayAddr"`
 	Session    string                  `json:"session"`
+	Clipboard  bool                    `json:"clipboard"`
 	Placements map[string]placedClient `json:"placements,omitempty"`
 }
 
@@ -115,6 +117,7 @@ func (a *App) LoadConfig() (ConfigDTO, error) {
 			}
 			dto.RelayAddr = p.RelayAddr
 			dto.Session = p.Session
+			dto.Clipboard = p.Clipboard
 			for name, pl := range p.Placements {
 				placements[name] = server.Placement{X: pl.X, Y: pl.Y}
 			}
@@ -164,6 +167,7 @@ func (a *App) writePersisted(cfg *ConfigDTO) error {
 		p.Addr = cfg.Addr
 		p.RelayAddr = cfg.RelayAddr
 		p.Session = cfg.Session
+		p.Clipboard = cfg.Clipboard
 	}
 	a.mu.Lock()
 	p.Placements = make(map[string]placedClient, len(a.placements))
@@ -231,11 +235,12 @@ func (a *App) Start(cfg ConfigDTO) error {
 	go func() {
 		defer close(done)
 		sc := server.Config{
-			Addr:       cfg.Addr,
-			Token:      cfg.Token,
-			RelayAddr:  cfg.RelayAddr,
-			Session:    cfg.Session,
-			Placements: placementsSnapshot,
+			Addr:            cfg.Addr,
+			Token:           cfg.Token,
+			RelayAddr:       cfg.RelayAddr,
+			Session:         cfg.Session,
+			EnableClipboard: cfg.Clipboard,
+			Placements:      placementsSnapshot,
 			OnRouterReady: func(r *server.Router) {
 				a.mu.Lock()
 				a.router = r
@@ -396,5 +401,11 @@ func (a *App) emitEvent(ev server.Event) {
 		runtime.EventsEmit(a.ctx, "rmouse:recvError", map[string]any{
 			"id": string(e.ID), "name": e.Name, "remote": e.RemoteAddr, "err": e.Err.Error(),
 		})
+	case server.ClipboardUnavailableEvent:
+		msg := ""
+		if e.Err != nil {
+			msg = e.Err.Error()
+		}
+		runtime.EventsEmit(a.ctx, "rmouse:clipboardUnavailable", map[string]any{"err": msg})
 	}
 }

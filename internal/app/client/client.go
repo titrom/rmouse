@@ -6,8 +6,10 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/titrom/rmouse/internal/platform"
@@ -18,13 +20,14 @@ import (
 // Config is the caller-supplied configuration for Run. All fields are
 // required unless marked otherwise.
 type Config struct {
-	Addr         string // server host:port; ignored when RelayAddr is set
-	ServerName   string // TLS SNI, defaults to "rmouse" when empty
-	Token        string // shared pairing token
-	Name         string // reported to server; caller should default to hostname
-	PingInterval time.Duration
-	RelayAddr    string // optional; when set client dials the relay
-	Session      string // relay session id; required iff RelayAddr != ""
+	Addr            string // server host:port; ignored when RelayAddr is set
+	ServerName      string // TLS SNI, defaults to "rmouse" when empty
+	Token           string // shared pairing token
+	Name            string // reported to server; caller should default to hostname
+	PingInterval    time.Duration
+	RelayAddr       string // optional; when set client dials the relay
+	Session         string // relay session id; required iff RelayAddr != ""
+	EnableClipboard bool
 }
 
 // State is the coarse lifecycle state surfaced to callers.
@@ -73,12 +76,17 @@ type GrabEvent struct {
 	On bool
 }
 
-func (StatusEvent) isEvent()              {}
-func (MonitorsEvent) isEvent()            {}
-func (PongEvent) isEvent()                {}
-func (HotplugUnavailableEvent) isEvent()  {}
-func (InjectorUnavailableEvent) isEvent() {}
-func (GrabEvent) isEvent()                {}
+type ClipboardUnavailableEvent struct {
+	Err error
+}
+
+func (StatusEvent) isEvent()               {}
+func (MonitorsEvent) isEvent()             {}
+func (PongEvent) isEvent()                 {}
+func (HotplugUnavailableEvent) isEvent()   {}
+func (InjectorUnavailableEvent) isEvent()  {}
+func (GrabEvent) isEvent()                 {}
+func (ClipboardUnavailableEvent) isEvent() {}
 
 // Run blocks until ctx is cancelled. It reports lifecycle events through sink.
 // sink must not block — callers that need buffering should wrap their own
@@ -110,11 +118,21 @@ func Run(ctx context.Context, cfg Config, sink func(Event)) error {
 	} else {
 		defer func() { _ = injector.Close() }()
 	}
+	var clipboard platform.Clipboard
+	if cfg.EnableClipboard {
+		cb, cbErr := platform.NewClipboard()
+		if cbErr != nil {
+			sink(ClipboardUnavailableEvent{Err: cbErr})
+		} else {
+			clipboard = cb
+			defer func() { _ = clipboard.Close() }()
+		}
+	}
 
 	backoff := time.Second
 	for ctx.Err() == nil {
 		sink(StatusEvent{State: StateConnecting})
-		sessionErr := runOnce(ctx, cfg, mons, injector, sink)
+		sessionErr := runOnce(ctx, cfg, mons, injector, clipboard, sink)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -207,7 +225,7 @@ func watchMonitors(ctx context.Context, disp platform.Display, store *monitorSto
 	}
 }
 
-func runOnce(ctx context.Context, cfg Config, mons *monitorStore, injector platform.Injector, sink func(Event)) error {
+func runOnce(ctx context.Context, cfg Config, mons *monitorStore, injector platform.Injector, clipboard platform.Clipboard, sink func(Event)) error {
 	snapshot := mons.snapshot()
 	tcfg := transport.ClientConfig{
 		Addr:       cfg.Addr,
@@ -256,6 +274,8 @@ func runOnce(ctx context.Context, cfg Config, mons *monitorStore, injector platf
 
 	errs := make(chan error, 2)
 	seq := uint32(0)
+	clipState := newClipboardSyncState()
+	var clipSeq atomic.Uint64
 
 	go func() {
 		defer close(readerDone)
@@ -266,9 +286,39 @@ func runOnce(ctx context.Context, cfg Config, mons *monitorStore, injector platf
 				errs <- err
 				return
 			}
-			dispatchIncoming(msg, injector, mons, sink, injected)
+			dispatchIncoming(msg, injector, mons, sink, injected, clipboard, clipState)
 		}
 	}()
+	if clipboard != nil {
+		go func() {
+			err := clipboard.Watch(ctx, func(format proto.ClipboardFormat, data []byte) {
+				if !validClipboardPayload(format, data) {
+					return
+				}
+				if !clipState.shouldSendLocal(format, data) {
+					return
+				}
+				msg := &proto.ClipboardUpdate{
+					OriginID: cfg.Name,
+					Seq:      clipSeq.Add(1),
+					Format:   format,
+					Data:     append([]byte(nil), data...),
+				}
+				if err := sess.Send(msg); err != nil {
+					select {
+					case errs <- err:
+					default:
+					}
+				}
+			})
+			if err != nil && !errors.Is(err, context.Canceled) {
+				select {
+				case errs <- err:
+				default:
+				}
+			}
+		}()
+	}
 
 	for {
 		select {
@@ -295,7 +345,7 @@ func runOnce(ctx context.Context, cfg Config, mons *monitorStore, injector platf
 // messages are ignored so future protocol additions don't break old clients.
 // injected tracks DOWN events we've applied so we can release them if the
 // session drops without matching UPs.
-func dispatchIncoming(msg proto.Message, injector platform.Injector, mons *monitorStore, sink func(Event), injected *injectedState) {
+func dispatchIncoming(msg proto.Message, injector platform.Injector, mons *monitorStore, sink func(Event), injected *injectedState, clipboard platform.Clipboard, clipState *clipboardSyncState) {
 	switch m := msg.(type) {
 	case *proto.Pong:
 		sink(PongEvent{Seq: m.Seq})
@@ -334,6 +384,12 @@ func dispatchIncoming(msg proto.Message, injector platform.Injector, mons *monit
 		if injector != nil {
 			if err := injector.KeyEvent(m.KeyCode, m.Down); err == nil {
 				injected.noteKey(m.KeyCode, m.Down)
+			}
+		}
+	case *proto.ClipboardUpdate:
+		if clipboard != nil && validClipboardPayload(m.Format, m.Data) {
+			if err := clipboard.Write(m.Format, m.Data); err == nil {
+				clipState.noteRemote(m.Format, m.Data)
 			}
 		}
 	}
@@ -415,4 +471,59 @@ func resolveAbs(monitors []proto.Monitor, m *proto.MouseAbs) (int32, int32, bool
 		}
 	}
 	return 0, 0, false
+}
+
+type clipboardSyncState struct {
+	mu           sync.Mutex
+	suppressTill time.Time
+	lastRemote   [32]byte
+	haveRemote   bool
+	lastLocal    [32]byte
+	haveLocal    bool
+}
+
+func newClipboardSyncState() *clipboardSyncState { return &clipboardSyncState{} }
+
+func (s *clipboardSyncState) shouldSendLocal(format proto.ClipboardFormat, data []byte) bool {
+	h := clipboardHash(format, data)
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.haveLocal && s.lastLocal == h {
+		return false
+	}
+	s.lastLocal = h
+	s.haveLocal = true
+	if now.Before(s.suppressTill) && s.haveRemote && s.lastRemote == h {
+		return false
+	}
+	return true
+}
+
+func (s *clipboardSyncState) noteRemote(format proto.ClipboardFormat, data []byte) {
+	h := clipboardHash(format, data)
+	s.mu.Lock()
+	s.lastRemote = h
+	s.haveRemote = true
+	s.lastLocal = h
+	s.haveLocal = true
+	s.suppressTill = time.Now().Add(1200 * time.Millisecond)
+	s.mu.Unlock()
+}
+
+func clipboardHash(format proto.ClipboardFormat, data []byte) [32]byte {
+	sum := sha256.Sum256(append([]byte{byte(format)}, data...))
+	return sum
+}
+
+func validClipboardPayload(format proto.ClipboardFormat, data []byte) bool {
+	if len(data) == 0 || len(data) > proto.MaxClipboardData {
+		return false
+	}
+	switch format {
+	case proto.ClipboardFormatTextPlain, proto.ClipboardFormatImagePNG, proto.ClipboardFormatFilesList:
+		return true
+	default:
+		return false
+	}
 }
