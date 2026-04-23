@@ -34,12 +34,12 @@ func main() {
 
 	err := wails.Run(&options.App{
 		Title:            "rmouse server",
-		Width:            900,
-		Height:           900,
-		MinWidth:         900,
-		MinHeight:        900,
-		MaxWidth:         900,
-		MaxHeight:        900,
+		Width:            1000,
+		Height:           1000,
+		MinWidth:         1000,
+		MinHeight:        1000,
+		MaxWidth:         1000,
+		MaxHeight:        1000,
 		DisableResize:    true,
 		BackgroundColour: &options.RGBA{R: 0, G: 0, B: 0, A: 0},
 		OnStartup:        app.startup,

@@ -4,6 +4,10 @@ import {main} from '../models';
 
 export function CertFingerprint():Promise<string>;
 
+export function ClearClipboardHistory():Promise<void>;
+
+export function GetClipboardHistory():Promise<Array<main.ClipboardHistoryItemDTO>>;
+
 export function GetPlacements():Promise<Array<main.PlacementDTO>>;
 
 export function GetServerMonitors():Promise<Array<main.MonitorDTO>>;
@@ -12,9 +16,13 @@ export function IsRunning():Promise<boolean>;
 
 export function LoadConfig():Promise<main.ConfigDTO>;
 
+export function RestoreClipboardItem(arg1:number):Promise<void>;
+
 export function SaveConfig(arg1:main.ConfigDTO):Promise<void>;
 
 export function SetClientPlacement(arg1:string,arg2:number,arg3:number):Promise<void>;
+
+export function ShowClipboardHistory():Promise<void>;
 
 export function Start(arg1:main.ConfigDTO):Promise<void>;
 

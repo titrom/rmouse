@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -17,6 +18,7 @@ import (
 	"github.com/zalando/go-keyring"
 
 	"github.com/titrom/rmouse/internal/app/server"
+	"github.com/titrom/rmouse/internal/clipboardhistory"
 	"github.com/titrom/rmouse/internal/platform"
 	"github.com/titrom/rmouse/internal/proto"
 	"github.com/titrom/rmouse/internal/transport"
@@ -35,13 +37,57 @@ type App struct {
 	done       chan struct{}
 	router     *server.Router
 	placements map[string]server.Placement
+
+	history     *clipboardhistory.History
+	restoreClip platform.Clipboard
+	hotkey      platform.Hotkey
+	hotkeyStop  chan struct{}
 }
 
-func NewApp() *App { return &App{} }
+func NewApp() *App {
+	return &App{history: clipboardhistory.New(30)}
+}
 
-func (a *App) startup(ctx context.Context) { a.ctx = ctx }
+func (a *App) startup(ctx context.Context) {
+	a.ctx = ctx
+	a.history.SetOnChange(func() {
+		runtime.EventsEmit(a.ctx, "rmouse:clipboardHistory", nil)
+	})
+	if cb, err := platform.NewClipboard(); err == nil {
+		a.restoreClip = cb
+	}
+	if hk, err := platform.NewClipboardHistoryHotkey(); err == nil {
+		a.hotkey = hk
+		a.hotkeyStop = make(chan struct{})
+		go a.drainHotkey()
+	} else {
+		runtime.EventsEmit(a.ctx, "rmouse:hotkeyUnavailable", map[string]any{"err": err.Error()})
+	}
+}
 
-func (a *App) shutdown(_ context.Context) { _ = a.Stop() }
+func (a *App) shutdown(_ context.Context) {
+	_ = a.Stop()
+	if a.hotkey != nil {
+		close(a.hotkeyStop)
+		a.hotkey.Close()
+	}
+	if a.restoreClip != nil {
+		_ = a.restoreClip.Close()
+	}
+}
+
+func (a *App) drainHotkey() {
+	for {
+		select {
+		case <-a.hotkeyStop:
+			return
+		case <-a.hotkey.Fired():
+			runtime.WindowShow(a.ctx)
+			runtime.WindowUnminimise(a.ctx)
+			runtime.EventsEmit(a.ctx, "rmouse:clipboardHistoryOpen", nil)
+		}
+	}
+}
 
 // --- DTOs ----------------------------------------------------------------
 
@@ -240,7 +286,10 @@ func (a *App) Start(cfg ConfigDTO) error {
 			RelayAddr:       cfg.RelayAddr,
 			Session:         cfg.Session,
 			EnableClipboard: cfg.Clipboard,
-			Placements:      placementsSnapshot,
+			OnClipboardItem: func(origin string, format proto.ClipboardFormat, data []byte) {
+				a.history.Add(format, data, origin)
+			},
+			Placements: placementsSnapshot,
 			OnRouterReady: func(r *server.Router) {
 				a.mu.Lock()
 				a.router = r
@@ -348,6 +397,79 @@ func (a *App) SetClientPlacement(name string, x, y int32) error {
 	a.placements[name] = server.Placement{X: x, Y: y}
 	a.mu.Unlock()
 	return a.writePersisted(nil)
+}
+
+// --- Clipboard history ---------------------------------------------------
+
+type ClipboardHistoryItemDTO struct {
+	ID          uint64 `json:"id"`
+	Kind        string `json:"kind"` // "text" | "image" | "files"
+	Origin      string `json:"origin"`
+	Timestamp   int64  `json:"timestamp"`
+	Preview     string `json:"preview"`
+	ImageBase64 string `json:"imageBase64,omitempty"`
+	SizeBytes   int    `json:"sizeBytes"`
+}
+
+func itemToDTO(it clipboardhistory.Item) ClipboardHistoryItemDTO {
+	dto := ClipboardHistoryItemDTO{
+		ID:        it.ID,
+		Origin:    it.Origin,
+		Timestamp: it.Timestamp.UnixMilli(),
+		SizeBytes: len(it.Data),
+	}
+	switch it.Format {
+	case proto.ClipboardFormatTextPlain:
+		dto.Kind = "text"
+		s := string(it.Data)
+		if len(s) > 200 {
+			s = s[:200] + "…"
+		}
+		dto.Preview = s
+	case proto.ClipboardFormatImagePNG:
+		dto.Kind = "image"
+		dto.ImageBase64 = base64.StdEncoding.EncodeToString(it.Data)
+	case proto.ClipboardFormatFilesList:
+		dto.Kind = "files"
+		var paths []string
+		if err := json.Unmarshal(it.Data, &paths); err == nil {
+			if len(paths) > 5 {
+				dto.Preview = fmt.Sprintf("%d files: %s, …", len(paths), paths[0])
+			} else {
+				dto.Preview = fmt.Sprintf("%d files: %v", len(paths), paths)
+			}
+		} else {
+			dto.Preview = string(it.Data)
+		}
+	}
+	return dto
+}
+
+func (a *App) GetClipboardHistory() []ClipboardHistoryItemDTO {
+	snap := a.history.Snapshot()
+	out := make([]ClipboardHistoryItemDTO, len(snap))
+	for i, it := range snap {
+		out[i] = itemToDTO(it)
+	}
+	return out
+}
+
+func (a *App) RestoreClipboardItem(id uint64) error {
+	if a.restoreClip == nil {
+		return errors.New("clipboard is not available on this platform")
+	}
+	it, ok := a.history.Get(id)
+	if !ok {
+		return fmt.Errorf("history item %d not found", id)
+	}
+	return a.restoreClip.Write(it.Format, it.Data)
+}
+
+func (a *App) ClearClipboardHistory() { a.history.Clear() }
+
+func (a *App) ShowClipboardHistory() {
+	runtime.WindowShow(a.ctx)
+	runtime.EventsEmit(a.ctx, "rmouse:clipboardHistoryOpen", nil)
 }
 
 func (a *App) emitEvent(ev server.Event) {

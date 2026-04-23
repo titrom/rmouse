@@ -15,6 +15,7 @@ import (
 	"image/png"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/titrom/rmouse/internal/proto"
@@ -25,17 +26,18 @@ type Clipboard struct{}
 func NewClipboard() (*Clipboard, error) { return &Clipboard{}, nil }
 
 var (
-	procOpenClipboard          = user32.NewProc("OpenClipboard")
-	procCloseClipboard         = user32.NewProc("CloseClipboard")
-	procGetClipboardData       = user32.NewProc("GetClipboardData")
-	procSetClipboardData       = user32.NewProc("SetClipboardData")
-	procEmptyClipboard         = user32.NewProc("EmptyClipboard")
-	procIsClipboardFormatAvail = user32.NewProc("IsClipboardFormatAvailable")
-	procGlobalLock             = kernel32.NewProc("GlobalLock")
-	procGlobalUnlock           = kernel32.NewProc("GlobalUnlock")
-	procGlobalSize             = kernel32.NewProc("GlobalSize")
-	procGlobalAlloc            = kernel32.NewProc("GlobalAlloc")
-	procGlobalFree             = kernel32.NewProc("GlobalFree")
+	procOpenClipboard              = user32.NewProc("OpenClipboard")
+	procCloseClipboard             = user32.NewProc("CloseClipboard")
+	procGetClipboardData           = user32.NewProc("GetClipboardData")
+	procSetClipboardData           = user32.NewProc("SetClipboardData")
+	procEmptyClipboard             = user32.NewProc("EmptyClipboard")
+	procIsClipboardFormatAvail     = user32.NewProc("IsClipboardFormatAvailable")
+	procGetClipboardSequenceNumber = user32.NewProc("GetClipboardSequenceNumber")
+	procGlobalLock                 = kernel32.NewProc("GlobalLock")
+	procGlobalUnlock               = kernel32.NewProc("GlobalUnlock")
+	procGlobalSize                 = kernel32.NewProc("GlobalSize")
+	procGlobalAlloc                = kernel32.NewProc("GlobalAlloc")
+	procGlobalFree                 = kernel32.NewProc("GlobalFree")
 )
 
 const (
@@ -107,15 +109,27 @@ func (c *Clipboard) Watch(ctx context.Context, sink func(format proto.ClipboardF
 	if sink == nil {
 		return nil
 	}
-	t := time.NewTicker(200 * time.Millisecond)
+	t := time.NewTicker(150 * time.Millisecond)
 	defer t.Stop()
 	var last [32]byte
 	var haveLast bool
+	// Windows increments this counter on every clipboard change — cheaper
+	// than doing a full Read (GlobalLock + memcopy + PNG re-encode) on every
+	// tick just to hash the contents unchanged.
+	var lastSeq uint32
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
+			seq := clipboardSequenceNumber()
+			// seq==0 usually means the process briefly couldn't access the
+			// clipboard; fall through to the Read (which retries on open)
+			// so we don't silently miss an update.
+			if seq != 0 && seq == lastSeq {
+				continue
+			}
+			lastSeq = seq
 			format, data, ok, err := c.Read()
 			if err != nil || !ok {
 				continue
@@ -129,6 +143,11 @@ func (c *Clipboard) Watch(ctx context.Context, sink func(format proto.ClipboardF
 			sink(format, append([]byte(nil), data...))
 		}
 	}
+}
+
+func clipboardSequenceNumber() uint32 {
+	r, _, _ := procGetClipboardSequenceNumber.Call()
+	return uint32(r)
 }
 
 func (c *Clipboard) Close() error { return nil }
@@ -188,6 +207,9 @@ func readText() (bool, []byte, error) {
 }
 
 func writeText(data []byte) error {
+	if !utf8.Valid(data) {
+		return errors.New("clipboard text is not valid UTF-8")
+	}
 	utf := utf16.Encode([]rune(string(data) + "\x00"))
 	b := make([]byte, len(utf)*2)
 	for i, v := range utf {
@@ -292,22 +314,31 @@ func parseMultiSZ(src []uint16) []string {
 }
 
 func readPNGImage() (bool, []byte, error) {
-	format := uintptr(cfDIBV5)
-	if !formatAvailable(format) {
-		format = cfDIB
+	// Prefer CF_DIB: Windows auto-synthesizes it from CF_DIBV5 as a 40-byte
+	// BITMAPINFOHEADER with BI_RGB compression, which our decoder handles
+	// trivially. Parsing CF_DIBV5 directly means dealing with BI_BITFIELDS
+	// and custom colour masks that many apps set.
+	var formats = []uintptr{cfDIB, cfDIBV5}
+	for _, f := range formats {
+		if !formatAvailable(f) {
+			continue
+		}
+		raw, err := readGlobalBytes(f)
+		if err != nil {
+			// Try the next format rather than aborting — a transient
+			// GlobalLock failure on one format shouldn't drop the image.
+			continue
+		}
+		pngData, convErr := dibToPNG(raw)
+		if convErr == nil {
+			return true, pngData, nil
+		}
+		// Remember the last conversion error; if every format fails, surface
+		// it so upstream logging can point at the real cause.
+		err = convErr
+		_ = err
 	}
-	if !formatAvailable(format) {
-		return false, nil, nil
-	}
-	raw, err := readGlobalBytes(format)
-	if err != nil {
-		return false, nil, err
-	}
-	pngData, err := dibToPNG(raw)
-	if err != nil {
-		return false, nil, err
-	}
-	return true, pngData, nil
+	return false, nil, nil
 }
 
 func writePNGImage(data []byte) error {
@@ -381,7 +412,14 @@ func dibToPNG(raw []byte) ([]byte, error) {
 	}
 	bpp := int(binary.LittleEndian.Uint16(raw[14:16]))
 	comp := binary.LittleEndian.Uint32(raw[16:20])
-	if comp != 0 {
+	// BI_RGB (0) and BI_BITFIELDS (3) both cover uncompressed 24/32bpp
+	// pixels in BGR/BGRA byte order for practically every image that lands
+	// on the Windows clipboard from browsers, Paint, and screenshot tools.
+	// BI_BITFIELDS technically allows arbitrary colour masks, but every
+	// common emitter uses the standard R/G/B/A bytes, so decoding as BGRA
+	// below yields the correct result.
+	const biRGB, biBitFields = 0, 3
+	if comp != biRGB && comp != biBitFields {
 		return nil, fmt.Errorf("unsupported DIB compression: %d", comp)
 	}
 	if bpp != 24 && bpp != 32 {
@@ -394,6 +432,11 @@ func dibToPNG(raw []byte) ([]byte, error) {
 		return nil, errors.New("truncated DIB pixel data")
 	}
 	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	// For 32bpp BI_RGB many Windows apps (Paint, Snipping Tool) leave the
+	// alpha byte zero across the whole image — round-tripping through PNG
+	// would produce a fully transparent result. Track whether any non-zero
+	// alpha was seen; if not, treat the image as opaque.
+	anyAlpha := bpp != 32
 	for y := 0; y < h; y++ {
 		srcY := y
 		if !topDown {
@@ -406,12 +449,25 @@ func dibToPNG(raw []byte) ([]byte, error) {
 			a := uint8(255)
 			if bpp == 32 {
 				a = row[i+3]
+				if a != 0 {
+					anyAlpha = true
+				}
 			}
 			img.SetNRGBA(x, y, color.NRGBA{R: r, G: g, B: b, A: a})
 		}
 	}
+	if !anyAlpha {
+		for i := 3; i < len(img.Pix); i += 4 {
+			img.Pix[i] = 255
+		}
+	}
 	var out bytes.Buffer
-	if err := png.Encode(&out, img); err != nil {
+	// BestSpeed keeps the clipboard watcher responsive for screenshot-sized
+	// images; the default (level 6) can take 300–800 ms on a 4K capture,
+	// which manifests as visible lag before an item appears in the history
+	// panel or reaches peers.
+	enc := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := enc.Encode(&out, img); err != nil {
 		return nil, err
 	}
 	return out.Bytes(), nil

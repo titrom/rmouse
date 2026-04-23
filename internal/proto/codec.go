@@ -7,10 +7,23 @@ import (
 	"io"
 )
 
-// MaxFrameSize caps a single decoded frame to guard against malformed input.
-// Clipboard sync may carry PNG payloads, so this limit is intentionally larger
-// than input-only frames.
+// MaxFrameSize caps a single decoded frame. Only the clipboard message type is
+// allowed to reach this size; every other type is bounded by MaxControlFrameSize
+// so a malicious peer can't force multi-MB allocations on the input path.
 const MaxFrameSize = 16 << 20 // 16 MiB
+
+// MaxControlFrameSize caps non-clipboard messages. Input/heartbeat frames are
+// tiny (tens of bytes); 1 MiB leaves headroom for MonitorsChanged/Hello with
+// long display names without opening a DoS window on hot paths.
+const MaxControlFrameSize = 1 << 20 // 1 MiB
+
+// frameLimit returns the upper bound on encoded payload size for the given type.
+func frameLimit(t MsgType) int {
+	if t == TypeClipboardUpdate {
+		return MaxFrameSize
+	}
+	return MaxControlFrameSize
+}
 
 var ErrUnknownType = errors.New("proto: unknown message type")
 
@@ -21,8 +34,8 @@ func Write(w io.Writer, m Message) error {
 	e.u8(uint8(m.Type()))
 	m.encode(e)
 	payload := e.buf
-	if len(payload) > MaxFrameSize {
-		return fmt.Errorf("proto: frame too large: %d", len(payload))
+	if limit := frameLimit(m.Type()); len(payload) > limit {
+		return fmt.Errorf("proto: frame too large for type %d: %d > %d", m.Type(), len(payload), limit)
 	}
 	var hdr [4]byte
 	binary.LittleEndian.PutUint32(hdr[:], uint32(len(payload)))
@@ -34,6 +47,8 @@ func Write(w io.Writer, m Message) error {
 }
 
 // Read decodes a single framed message from r.
+// Reads the length, then the 1-byte type tag, then applies a per-type size cap
+// before allocating the full payload buffer.
 func Read(r io.Reader) (Message, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
@@ -46,11 +61,21 @@ func Read(r io.Reader) (Message, error) {
 	if length > MaxFrameSize {
 		return nil, fmt.Errorf("proto: frame too large: %d", length)
 	}
-	buf := make([]byte, length)
-	if _, err := io.ReadFull(r, buf); err != nil {
+	var typeBuf [1]byte
+	if _, err := io.ReadFull(r, typeBuf[:]); err != nil {
 		return nil, err
 	}
-	t := MsgType(buf[0])
+	t := MsgType(typeBuf[0])
+	if limit := uint32(frameLimit(t)); length > limit {
+		return nil, fmt.Errorf("proto: frame too large for type %d: %d > %d", t, length, limit)
+	}
+	buf := make([]byte, length)
+	buf[0] = typeBuf[0]
+	if length > 1 {
+		if _, err := io.ReadFull(r, buf[1:]); err != nil {
+			return nil, err
+		}
+	}
 	msg := newByType(t)
 	if msg == nil {
 		return nil, fmt.Errorf("%w: %d", ErrUnknownType, t)

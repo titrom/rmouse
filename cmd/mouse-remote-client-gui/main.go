@@ -22,12 +22,12 @@ func main() {
 
 	err := wails.Run(&options.App{
 		Title:         "rmouse client",
-		Width:         900,
-		Height:        800,
-		MinWidth:      900,
-		MinHeight:     800,
-		MaxWidth:      900,
-		MaxHeight:     800,
+		Width:         1000,
+		Height:        900,
+		MinWidth:      1000,
+		MinHeight:     900,
+		MaxWidth:      1000,
+		MaxHeight:     900,
 		DisableResize: true,
 		// Transparent background lets the native acrylic/mica/vibrancy come
 		// through behind the web content.

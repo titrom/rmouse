@@ -3,9 +3,13 @@
   import {
     LoadConfig, SaveConfig, Start, Stop, IsRunning, CertFingerprint,
     GetServerMonitors, GetPlacements, SetClientPlacement,
+    ShowClipboardHistory,
   } from "../wailsjs/go/main/App";
   import { EventsOn, EventsOff } from "../wailsjs/runtime/runtime";
   import { main } from "../wailsjs/go/models";
+  import ClipboardHistory from "./ClipboardHistory.svelte";
+
+  let historyOpen = false;
 
   let addr = "0.0.0.0:24242";
   let token = "";
@@ -710,6 +714,8 @@
   }
   function onRecvErr(p: any) { log("warn", `recv ${p?.name ?? p?.id}: ${p?.err}`); }
   function onClipboardUnavailable(p: any) { log("warn", `clipboard unavailable: ${p?.err ?? ""}`); }
+  function onOpenHistory() { historyOpen = true; }
+  function onHotkeyUnavailable(p: any) { log("warn", `hotkey unavailable: ${p?.err ?? ""}`); }
 
   let stageObserver: ResizeObserver | null = null;
   onMount(() => {
@@ -724,6 +730,8 @@
     EventsOn("rmouse:recvError", onRecvErr);
     EventsOn("rmouse:serverMonitors", onMonitorsEvent);
     EventsOn("rmouse:clipboardUnavailable", onClipboardUnavailable);
+    EventsOn("rmouse:clipboardHistoryOpen", onOpenHistory);
+    EventsOn("rmouse:hotkeyUnavailable", onHotkeyUnavailable);
     if (stage) {
       stageObserver = new ResizeObserver(() => {
         stageW = stage.clientWidth;
@@ -741,6 +749,8 @@
     EventsOff("rmouse:recvError");
     EventsOff("rmouse:serverMonitors");
     EventsOff("rmouse:clipboardUnavailable");
+    EventsOff("rmouse:clipboardHistoryOpen");
+    EventsOff("rmouse:hotkeyUnavailable");
     stageObserver?.disconnect();
   });
 </script>
@@ -770,6 +780,15 @@
       <input id="token" type="password" bind:value={token} placeholder="shared secret" disabled={running} />
     </div>
 
+    <div class="field check">
+      <label for="clipboard">Clipboard sync</label>
+      <input id="clipboard" type="checkbox" bind:checked={clipboard} disabled={running} />
+    </div>
+
+    <button type="button" class="link-btn hist-btn" on:click={() => ShowClipboardHistory()} title="Ctrl+Shift+V">
+      Clipboard history…
+    </button>
+
     <details class="advanced">
       <summary>Relay (optional)</summary>
       <div class="field">
@@ -779,10 +798,6 @@
       <div class="field">
         <label for="session">Session</label>
         <input id="session" type="text" bind:value={session} placeholder="session id" disabled={running} />
-      </div>
-      <div class="field check">
-        <label for="clipboard">Clipboard sync</label>
-        <input id="clipboard" type="checkbox" bind:checked={clipboard} disabled={running} />
       </div>
     </details>
 
@@ -924,3 +939,5 @@
     </div>
   </section>
 </main>
+
+<ClipboardHistory bind:open={historyOpen} on:close={() => historyOpen = false} />

@@ -6,6 +6,14 @@ export function CertFingerprint() {
   return window['go']['main']['App']['CertFingerprint']();
 }
 
+export function ClearClipboardHistory() {
+  return window['go']['main']['App']['ClearClipboardHistory']();
+}
+
+export function GetClipboardHistory() {
+  return window['go']['main']['App']['GetClipboardHistory']();
+}
+
 export function GetPlacements() {
   return window['go']['main']['App']['GetPlacements']();
 }
@@ -22,12 +30,20 @@ export function LoadConfig() {
   return window['go']['main']['App']['LoadConfig']();
 }
 
+export function RestoreClipboardItem(arg1) {
+  return window['go']['main']['App']['RestoreClipboardItem'](arg1);
+}
+
 export function SaveConfig(arg1) {
   return window['go']['main']['App']['SaveConfig'](arg1);
 }
 
 export function SetClientPlacement(arg1, arg2, arg3) {
   return window['go']['main']['App']['SetClientPlacement'](arg1, arg2, arg3);
+}
+
+export function ShowClipboardHistory() {
+  return window['go']['main']['App']['ShowClipboardHistory']();
 }
 
 export function Start(arg1) {

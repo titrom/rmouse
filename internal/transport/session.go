@@ -53,6 +53,19 @@ func (s *Session) Send(m proto.Message) error {
 	return proto.Write(s.conn, m)
 }
 
+// SendWithTimeout is like Send but aborts if the underlying conn can't drain
+// within timeout. On timeout the frame on the wire is partial and the session
+// is unusable — caller must Close(). Used for clipboard broadcast, where one
+// stalled peer must not block updates to the others.
+func (s *Session) SendWithTimeout(m proto.Message, timeout time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.conn.SetWriteDeadline(time.Now().Add(timeout))
+	err := proto.Write(s.conn, m)
+	_ = s.conn.SetWriteDeadline(time.Time{})
+	return err
+}
+
 // Recv reads one framed message.
 func (s *Session) Recv() (proto.Message, error) {
 	return proto.Read(s.conn)

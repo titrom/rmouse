@@ -1,5 +1,29 @@
 export namespace main {
 	
+	export class ClipboardHistoryItemDTO {
+	    id: number;
+	    kind: string;
+	    origin: string;
+	    timestamp: number;
+	    preview: string;
+	    imageBase64?: string;
+	    sizeBytes: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new ClipboardHistoryItemDTO(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.kind = source["kind"];
+	        this.origin = source["origin"];
+	        this.timestamp = source["timestamp"];
+	        this.preview = source["preview"];
+	        this.imageBase64 = source["imageBase64"];
+	        this.sizeBytes = source["sizeBytes"];
+	    }
+	}
 	export class ConfigDTO {
 	    addr: string;
 	    token: string;

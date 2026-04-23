@@ -3,10 +3,15 @@
   import { slide } from "svelte/transition";
   import {
     EnumerateMonitors, IsRunning, LoadConfig, SaveConfig, Start, Stop,
-    HasInputPermission, RequestInputPermission,
+    HasInputPermission, RequestInputPermission, ShowClipboardHistory,
   } from "../wailsjs/go/main/App";
   import { EventsOn, EventsOff } from "../wailsjs/runtime/runtime";
   import { main } from "../wailsjs/go/models";
+  import ClipboardHistory from "./ClipboardHistory.svelte";
+
+  let historyOpen = false;
+  function onOpenHistory() { historyOpen = true; }
+  function onHotkeyUnavailable(p: any) { log("warn", `hotkey unavailable: ${p?.err ?? ""}`); }
 
   // --- config + connection state -----------------------------------------
   let addr = "127.0.0.1:24242";
@@ -221,6 +226,8 @@
     EventsOn("rmouse:injectorUnavailable", onInjectorUnavailable);
     EventsOn("rmouse:grab", onGrab);
     EventsOn("rmouse:clipboardUnavailable", onClipboardUnavailable);
+    EventsOn("rmouse:clipboardHistoryOpen", onOpenHistory);
+    EventsOn("rmouse:hotkeyUnavailable", onHotkeyUnavailable);
     EventsOn("rmouse:stopped", onStopped);
     EventsOn("rmouse:fatal", onFatal);
     if (stage) {
@@ -238,6 +245,8 @@
     EventsOff("rmouse:injectorUnavailable");
     EventsOff("rmouse:grab");
     EventsOff("rmouse:clipboardUnavailable");
+    EventsOff("rmouse:clipboardHistoryOpen");
+    EventsOff("rmouse:hotkeyUnavailable");
     EventsOff("rmouse:stopped");
     EventsOff("rmouse:fatal");
     stageObserver?.disconnect();
@@ -288,6 +297,15 @@
         <input id="name" type="text" bind:value={name} placeholder="(hostname)" disabled={running} />
       </div>
 
+      <div class="field check">
+        <label for="clipboard-main">Clipboard sync</label>
+        <input id="clipboard-main" type="checkbox" bind:checked={clipboard} disabled={running} />
+      </div>
+
+      <button class="link-btn" on:click={() => ShowClipboardHistory()} title="Ctrl+Shift+V">
+        Clipboard history…
+      </button>
+
       <button class="adv-toggle" on:click={() => advancedOpen = !advancedOpen}
               aria-expanded={advancedOpen}>
         {advancedOpen ? "▾" : "▸"} Advanced
@@ -324,10 +342,6 @@
         <div class="field">
           <label for="session">Session</label>
           <input id="session" type="text" bind:value={session} placeholder="(required with relay)" disabled={running} />
-        </div>
-        <div class="field check">
-          <label for="clipboard">Clipboard sync</label>
-          <input id="clipboard" type="checkbox" bind:checked={clipboard} disabled={running} />
         </div>
       </section>
     {/if}
@@ -393,3 +407,5 @@
     </div>
   </section>
 </main>
+
+<ClipboardHistory bind:open={historyOpen} on:close={() => historyOpen = false} />

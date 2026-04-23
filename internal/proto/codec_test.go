@@ -108,3 +108,49 @@ func TestClipboardWriteTooLarge(t *testing.T) {
 		t.Fatal("expected frame-too-large error")
 	}
 }
+
+// TestReadControlFrameTooLarge asserts that non-clipboard types are rejected
+// when they exceed MaxControlFrameSize, even if under MaxFrameSize — so a
+// malicious peer can't force multi-MB allocations on the heartbeat/input path.
+func TestReadControlFrameTooLarge(t *testing.T) {
+	var buf bytes.Buffer
+	// length = MaxControlFrameSize+1, type = TypePing (control path)
+	length := uint32(MaxControlFrameSize + 1)
+	buf.Write([]byte{
+		byte(length), byte(length >> 8), byte(length >> 16), byte(length >> 24),
+		byte(TypePing),
+	})
+	// no payload: if Read passes the type cap it will next ReadFull and hit EOF,
+	// which is a different error path than the one under test. The cap check
+	// runs before the payload read, so we should get a "too large" error here.
+	_, err := Read(&buf)
+	if err == nil {
+		t.Fatal("expected frame-too-large error for Ping at control-frame cap")
+	}
+}
+
+// TestReadClipboardFrameAboveControlCap asserts that ClipboardUpdate is
+// allowed to exceed MaxControlFrameSize (up to MaxFrameSize).
+func TestReadClipboardFrameAboveControlCap(t *testing.T) {
+	payload := make([]byte, MaxControlFrameSize+1024)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	var buf bytes.Buffer
+	msg := &ClipboardUpdate{
+		OriginID: "c",
+		Seq:      1,
+		Format:   ClipboardFormatImagePNG,
+		Data:     payload,
+	}
+	if err := Write(&buf, msg); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := Read(&buf)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if _, ok := got.(*ClipboardUpdate); !ok {
+		t.Fatalf("expected *ClipboardUpdate, got %T", got)
+	}
+}

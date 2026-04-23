@@ -28,6 +28,13 @@ type Config struct {
 	RelayAddr       string // optional; when set client dials the relay
 	Session         string // relay session id; required iff RelayAddr != ""
 	EnableClipboard bool
+
+	// OnClipboardItem, if non-nil, is invoked whenever a clipboard snapshot
+	// passes through this client — either observed locally (origin=="local")
+	// or received from the server (origin = upstream OriginID). Used by the
+	// GUI to feed its history panel. Must not block; callers should hand off
+	// to their own goroutine if the work is non-trivial.
+	OnClipboardItem func(origin string, format proto.ClipboardFormat, data []byte)
 }
 
 // State is the coarse lifecycle state surfaced to callers.
@@ -286,7 +293,7 @@ func runOnce(ctx context.Context, cfg Config, mons *monitorStore, injector platf
 				errs <- err
 				return
 			}
-			dispatchIncoming(msg, injector, mons, sink, injected, clipboard, clipState)
+			dispatchIncoming(msg, injector, mons, sink, injected, clipboard, clipState, cfg.OnClipboardItem)
 		}
 	}()
 	if clipboard != nil {
@@ -297,6 +304,9 @@ func runOnce(ctx context.Context, cfg Config, mons *monitorStore, injector platf
 				}
 				if !clipState.shouldSendLocal(format, data) {
 					return
+				}
+				if cfg.OnClipboardItem != nil {
+					cfg.OnClipboardItem("local", format, data)
 				}
 				msg := &proto.ClipboardUpdate{
 					OriginID: cfg.Name,
@@ -345,7 +355,7 @@ func runOnce(ctx context.Context, cfg Config, mons *monitorStore, injector platf
 // messages are ignored so future protocol additions don't break old clients.
 // injected tracks DOWN events we've applied so we can release them if the
 // session drops without matching UPs.
-func dispatchIncoming(msg proto.Message, injector platform.Injector, mons *monitorStore, sink func(Event), injected *injectedState, clipboard platform.Clipboard, clipState *clipboardSyncState) {
+func dispatchIncoming(msg proto.Message, injector platform.Injector, mons *monitorStore, sink func(Event), injected *injectedState, clipboard platform.Clipboard, clipState *clipboardSyncState, onClipboardItem func(origin string, format proto.ClipboardFormat, data []byte)) {
 	switch m := msg.(type) {
 	case *proto.Pong:
 		sink(PongEvent{Seq: m.Seq})
@@ -390,6 +400,9 @@ func dispatchIncoming(msg proto.Message, injector platform.Injector, mons *monit
 		if clipboard != nil && validClipboardPayload(m.Format, m.Data) {
 			if err := clipboard.Write(m.Format, m.Data); err == nil {
 				clipState.noteRemote(m.Format, m.Data)
+				if onClipboardItem != nil {
+					onClipboardItem(m.OriginID, m.Format, m.Data)
+				}
 			}
 		}
 	}
@@ -484,6 +497,12 @@ type clipboardSyncState struct {
 
 func newClipboardSyncState() *clipboardSyncState { return &clipboardSyncState{} }
 
+// clipboardSuppressWindow is the time window after noteRemote during which
+// shouldSendLocal returns false. Must be loose (not gated on hash equality)
+// because PNG round-trips through the OS clipboard are non-deterministic —
+// the watcher observes a hash different from the one we just applied.
+const clipboardSuppressWindow = 1500 * time.Millisecond
+
 func (s *clipboardSyncState) shouldSendLocal(format proto.ClipboardFormat, data []byte) bool {
 	h := clipboardHash(format, data)
 	now := time.Now()
@@ -492,11 +511,11 @@ func (s *clipboardSyncState) shouldSendLocal(format proto.ClipboardFormat, data 
 	if s.haveLocal && s.lastLocal == h {
 		return false
 	}
-	s.lastLocal = h
-	s.haveLocal = true
-	if now.Before(s.suppressTill) && s.haveRemote && s.lastRemote == h {
+	if now.Before(s.suppressTill) {
 		return false
 	}
+	s.lastLocal = h
+	s.haveLocal = true
 	return true
 }
 
@@ -507,7 +526,7 @@ func (s *clipboardSyncState) noteRemote(format proto.ClipboardFormat, data []byt
 	s.haveRemote = true
 	s.lastLocal = h
 	s.haveLocal = true
-	s.suppressTill = time.Now().Add(1200 * time.Millisecond)
+	s.suppressTill = time.Now().Add(clipboardSuppressWindow)
 	s.mu.Unlock()
 }
 

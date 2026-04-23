@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"github.com/zalando/go-keyring"
 
 	"github.com/titrom/rmouse/internal/app/client"
+	"github.com/titrom/rmouse/internal/clipboardhistory"
 	"github.com/titrom/rmouse/internal/platform"
 	"github.com/titrom/rmouse/internal/proto"
 )
@@ -30,13 +32,62 @@ type App struct {
 	mu     sync.Mutex
 	cancel context.CancelFunc
 	done   chan struct{} // closed when the current Run returns
+
+	history *clipboardhistory.History
+	// restoreClip is a long-lived Clipboard handle used only by
+	// RestoreClipboardItem — independent from the session's own Watcher so
+	// the user can pick from history even when not connected.
+	restoreClip platform.Clipboard
+	hotkey      platform.Hotkey
+	hotkeyStop  chan struct{}
 }
 
-func NewApp() *App { return &App{} }
+func NewApp() *App {
+	return &App{
+		history: clipboardhistory.New(30),
+	}
+}
 
-func (a *App) startup(ctx context.Context) { a.ctx = ctx }
+func (a *App) startup(ctx context.Context) {
+	a.ctx = ctx
+	a.history.SetOnChange(func() {
+		runtime.EventsEmit(a.ctx, "rmouse:clipboardHistory", nil)
+	})
+	if cb, err := platform.NewClipboard(); err == nil {
+		a.restoreClip = cb
+	}
+	if hk, err := platform.NewClipboardHistoryHotkey(); err == nil {
+		a.hotkey = hk
+		a.hotkeyStop = make(chan struct{})
+		go a.drainHotkey()
+	} else {
+		runtime.EventsEmit(a.ctx, "rmouse:hotkeyUnavailable", map[string]any{"err": err.Error()})
+	}
+}
 
-func (a *App) shutdown(_ context.Context) { _ = a.Stop() }
+func (a *App) shutdown(_ context.Context) {
+	_ = a.Stop()
+	if a.hotkey != nil {
+		close(a.hotkeyStop)
+		a.hotkey.Close()
+	}
+	if a.restoreClip != nil {
+		_ = a.restoreClip.Close()
+	}
+}
+
+func (a *App) drainHotkey() {
+	for {
+		select {
+		case <-a.hotkeyStop:
+			return
+		case <-a.hotkey.Fired():
+			runtime.WindowShow(a.ctx)
+			runtime.WindowUnminimise(a.ctx)
+			runtime.EventsEmit(a.ctx, "rmouse:clipboardHistoryOpen", nil)
+		}
+	}
+}
 
 // --- DTOs ----------------------------------------------------------------
 
@@ -203,6 +254,9 @@ func (a *App) Start(cfg ConfigDTO) error {
 			RelayAddr:       cfg.RelayAddr,
 			Session:         cfg.Session,
 			EnableClipboard: cfg.Clipboard,
+			OnClipboardItem: func(origin string, format proto.ClipboardFormat, data []byte) {
+				a.history.Add(format, data, origin)
+			},
 		}
 		err := client.Run(ctx, cc, func(ev client.Event) {
 			a.emitEvent(ev)
@@ -238,6 +292,92 @@ func (a *App) IsRunning() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.cancel != nil
+}
+
+// --- Clipboard history ---------------------------------------------------
+
+// ClipboardHistoryItemDTO is one entry surfaced to the GUI. Small text and
+// file-list payloads are inlined; PNG images are sent as base64 so Svelte
+// can render them via `src="data:image/png;base64,..."`. The full payload
+// stays in the Go-side history and is restored by RestoreClipboardItem.
+type ClipboardHistoryItemDTO struct {
+	ID         uint64 `json:"id"`
+	Kind       string `json:"kind"` // "text" | "image" | "files"
+	Origin     string `json:"origin"`
+	Timestamp  int64  `json:"timestamp"` // unix millis
+	Preview    string `json:"preview"`   // ≤200 chars for text/files
+	ImageBase64 string `json:"imageBase64,omitempty"`
+	SizeBytes  int    `json:"sizeBytes"`
+}
+
+func itemToDTO(it clipboardhistory.Item) ClipboardHistoryItemDTO {
+	dto := ClipboardHistoryItemDTO{
+		ID:        it.ID,
+		Origin:    it.Origin,
+		Timestamp: it.Timestamp.UnixMilli(),
+		SizeBytes: len(it.Data),
+	}
+	switch it.Format {
+	case proto.ClipboardFormatTextPlain:
+		dto.Kind = "text"
+		s := string(it.Data)
+		if len(s) > 200 {
+			s = s[:200] + "…"
+		}
+		dto.Preview = s
+	case proto.ClipboardFormatImagePNG:
+		dto.Kind = "image"
+		// Thumbnail would be nicer; inlining full PNG is fine for the
+		// 16 MiB cap and ≤30 history items.
+		dto.ImageBase64 = base64.StdEncoding.EncodeToString(it.Data)
+	case proto.ClipboardFormatFilesList:
+		dto.Kind = "files"
+		var paths []string
+		if err := json.Unmarshal(it.Data, &paths); err == nil {
+			if len(paths) > 5 {
+				dto.Preview = fmt.Sprintf("%d files: %s, …", len(paths), paths[0])
+			} else {
+				dto.Preview = fmt.Sprintf("%d files: %v", len(paths), paths)
+			}
+		} else {
+			dto.Preview = string(it.Data)
+		}
+	}
+	return dto
+}
+
+// GetClipboardHistory returns the history snapshot, newest first.
+func (a *App) GetClipboardHistory() []ClipboardHistoryItemDTO {
+	snap := a.history.Snapshot()
+	out := make([]ClipboardHistoryItemDTO, len(snap))
+	for i, it := range snap {
+		out[i] = itemToDTO(it)
+	}
+	return out
+}
+
+// RestoreClipboardItem writes the history item with the given id back to
+// the OS clipboard. Propagation to peers happens automatically via the
+// session's clipboard Watcher if sync is enabled.
+func (a *App) RestoreClipboardItem(id uint64) error {
+	if a.restoreClip == nil {
+		return errors.New("clipboard is not available on this platform")
+	}
+	it, ok := a.history.Get(id)
+	if !ok {
+		return fmt.Errorf("history item %d not found", id)
+	}
+	return a.restoreClip.Write(it.Format, it.Data)
+}
+
+// ClearClipboardHistory drops every history entry.
+func (a *App) ClearClipboardHistory() { a.history.Clear() }
+
+// ShowClipboardHistory is an in-app button fallback when the global hotkey
+// is unavailable. Emits the same event the hotkey does.
+func (a *App) ShowClipboardHistory() {
+	runtime.WindowShow(a.ctx)
+	runtime.EventsEmit(a.ctx, "rmouse:clipboardHistoryOpen", nil)
 }
 
 // HasInputPermission used to report uinput writability on the old Linux

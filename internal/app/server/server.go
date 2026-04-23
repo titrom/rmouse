@@ -38,6 +38,12 @@ type Config struct {
 	// placement is created or modified. Mirrored into the router.
 	OnPlacementChanged func(name string, p Placement)
 	EnableClipboard    bool
+
+	// OnClipboardItem, if non-nil, is invoked whenever a clipboard snapshot
+	// passes through this server — either observed locally (origin="server")
+	// or received from a client (origin = peer name). Used by the GUI to
+	// feed its history panel. Must not block.
+	OnClipboardItem func(origin string, format proto.ClipboardFormat, data []byte)
 }
 
 // Event is a sum type of things Run reports.
@@ -222,6 +228,7 @@ func Run(ctx context.Context, cfg Config, sink func(Event)) error {
 	}
 	hub = newClipboardHub(clipboard)
 	if hub != nil {
+		hub.onItem = cfg.OnClipboardItem
 		go hub.watchLocal(ctx)
 	}
 	handler := func(s *transport.Session, hello *proto.Hello) {
@@ -296,20 +303,32 @@ func handleClient(ctx context.Context, s *transport.Session, hello *proto.Hello,
 			return
 		case *proto.ClipboardUpdate:
 			if hub != nil && validClipboardPayload(m.Format, m.Data) {
-				hub.applyRemote(m.Format, m.Data)
+				hub.applyRemote(name, m.Format, m.Data)
 				hub.broadcast(id, m)
 			}
 		}
 	}
 }
 
+// clipboardSuppressWindow is the time window after applyRemote during which
+// the local watcher ignores changes. Covers the re-encoding round-trip on
+// formats where hash(input) != hash(read-back) — notably PNG on Windows
+// (DIB→PNG is non-deterministic) and DIB alpha-channel corrections.
+const clipboardSuppressWindow = 1500 * time.Millisecond
+
 type clipboardHub struct {
 	clipboard platform.Clipboard
 
-	mu       sync.Mutex
-	sessions map[ConnID]*transport.Session
-	lastHash [32]byte
-	haveHash bool
+	mu           sync.Mutex
+	sessions     map[ConnID]*transport.Session
+	lastHash     [32]byte
+	haveHash     bool
+	suppressTill time.Time
+
+	// onItem is invoked (without hub.mu held) whenever a clipboard snapshot
+	// is processed — either from a peer (applyRemote) or locally
+	// (watchLocal). Set once before Run spins up the watcher goroutine.
+	onItem func(origin string, format proto.ClipboardFormat, data []byte)
 }
 
 func newClipboardHub(clipboard platform.Clipboard) *clipboardHub {
@@ -334,6 +353,11 @@ func (h *clipboardHub) remove(id ConnID) {
 	h.mu.Unlock()
 }
 
+// clipboardBroadcastTimeout bounds how long we'll wait on a single peer's
+// Send. If exceeded, we close that session so one stalled client can't block
+// the watcher goroutine and queue up clipboard updates for everyone else.
+const clipboardBroadcastTimeout = 2 * time.Second
+
 func (h *clipboardHub) broadcast(skip ConnID, msg *proto.ClipboardUpdate) {
 	h.mu.Lock()
 	peers := make([]*transport.Session, 0, len(h.sessions))
@@ -345,18 +369,29 @@ func (h *clipboardHub) broadcast(skip ConnID, msg *proto.ClipboardUpdate) {
 	}
 	h.mu.Unlock()
 	for _, peer := range peers {
-		_ = peer.Send(msg)
+		if err := peer.SendWithTimeout(msg, clipboardBroadcastTimeout); err != nil {
+			_ = peer.Close()
+		}
 	}
 }
 
-func (h *clipboardHub) applyRemote(format proto.ClipboardFormat, data []byte) {
+func (h *clipboardHub) applyRemote(origin string, format proto.ClipboardFormat, data []byte) {
 	if !validClipboardPayload(format, data) {
 		return
 	}
 	if err := h.clipboard.Write(format, data); err != nil {
 		return
 	}
-	h.setLastHash(clipboardHash(format, data))
+	hash := clipboardHash(format, data)
+	h.mu.Lock()
+	h.lastHash = hash
+	h.haveHash = true
+	h.suppressTill = time.Now().Add(clipboardSuppressWindow)
+	cb := h.onItem
+	h.mu.Unlock()
+	if cb != nil {
+		cb(origin, format, data)
+	}
 }
 
 func (h *clipboardHub) watchLocal(ctx context.Context) {
@@ -365,7 +400,7 @@ func (h *clipboardHub) watchLocal(ctx context.Context) {
 			return
 		}
 		hash := clipboardHash(format, data)
-		if h.isDuplicate(hash) {
+		if h.shouldSuppress(hash) {
 			return
 		}
 		msg := &proto.ClipboardUpdate{
@@ -376,13 +411,26 @@ func (h *clipboardHub) watchLocal(ctx context.Context) {
 		}
 		h.broadcast("", msg)
 		h.setLastHash(hash)
+		h.mu.Lock()
+		cb := h.onItem
+		h.mu.Unlock()
+		if cb != nil {
+			cb("server", format, data)
+		}
 	})
 }
 
-func (h *clipboardHub) isDuplicate(hash [32]byte) bool {
+// shouldSuppress reports whether the watcher callback should swallow this
+// update. Suppressed when it's an exact duplicate of the last emitted/applied
+// content, or when we're still inside the post-applyRemote settling window
+// (covers non-deterministic re-encoding paths).
+func (h *clipboardHub) shouldSuppress(hash [32]byte) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.haveHash && h.lastHash == hash
+	if h.haveHash && h.lastHash == hash {
+		return true
+	}
+	return time.Now().Before(h.suppressTill)
 }
 
 func (h *clipboardHub) setLastHash(hash [32]byte) {
